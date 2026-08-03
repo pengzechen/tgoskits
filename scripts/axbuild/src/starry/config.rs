@@ -48,23 +48,37 @@ fn write_board_to_build_config(build_config_path: &Path, board: &Board) -> anyho
             build_config_path.display()
         )
     })?;
+    copy_companion_its(&board.path, build_config_path)?;
     Ok(())
 }
 
-fn update_snapshot_for_board(workspace_root: &Path, board: &Board) -> anyhow::Result<()> {
+fn copy_companion_its(src_config: &Path, dst_config: &Path) -> anyhow::Result<()> {
+    let src_its = src_config.with_extension("its");
+    if !src_its.exists() {
+        return Ok(());
+    }
+    let dst_its = dst_config.with_extension("its");
+    fs::copy(&src_its, &dst_its).map_err(|e| {
+        anyhow!(
+            "failed to copy Starry uImage ITS {} to {}: {e}",
+            src_its.display(),
+            dst_its.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn update_snapshot_for_board(
+    workspace_root: &Path,
+    board: &Board,
+    build_config_path: &Path,
+) -> anyhow::Result<()> {
     let mut snapshot = StarryCommandSnapshot::load(workspace_root)?;
     snapshot.arch = Some(starry_arch_for_target_checked(&board.target)?.to_string());
     snapshot.target = Some(board.target.clone());
-    snapshot.qemu.qemu_config = snapshot
-        .qemu
-        .qemu_config
-        .as_ref()
-        .map(|path| snapshot_path_value(workspace_root, path));
-    snapshot.uboot.uboot_config = snapshot
-        .uboot
-        .uboot_config
-        .as_ref()
-        .map(|path| snapshot_path_value(workspace_root, path));
+    snapshot.config = Some(snapshot_path_value(workspace_root, build_config_path));
+    snapshot.qemu.qemu_config = None;
+    snapshot.uboot.uboot_config = None;
     snapshot.store(workspace_root)?;
     Ok(())
 }
@@ -87,15 +101,16 @@ pub(crate) fn ensure_default_build_config_for_target(
                 .unwrap_or_else(|_| "os/StarryOS/configs/board".to_string())
         )
     })?;
+    // This only materializes a missing build config. The command dispatcher owns
+    // snapshot persistence, so implicit config creation cannot alter it here.
     write_board_to_build_config(build_config_path, &board)?;
-    update_snapshot_for_board(workspace_root, &board)?;
     Ok(Some(board))
 }
 
 pub(crate) fn write_defconfig(workspace_root: &Path, board_name: &str) -> anyhow::Result<PathBuf> {
     let board = resolve_board(workspace_root, board_name)?;
     let build_config_path = write_board_to_default_build_config(workspace_root, &board)?;
-    update_snapshot_for_board(workspace_root, &board)?;
+    update_snapshot_for_board(workspace_root, &board, &build_config_path)?;
     Ok(build_config_path)
 }
 
@@ -140,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    fn write_defconfig_generates_build_file_and_updates_snapshot() {
+    fn write_defconfig_generates_build_file_and_resets_runtime_config() {
         let root = tempdir().unwrap();
         write_workspace(root.path());
         let source = write_board(
@@ -148,18 +163,19 @@ mod tests {
             "qemu-riscv64",
             r#"
 target = "riscv64gc-unknown-none-elf"
-env = { AX_IP = "10.0.2.15", AX_GW = "10.0.2.2" }
-features = ["qemu"]
+features = ["ax-driver/serial", "ax-driver/nvme"]
 log = "Warn"
-plat_dyn = false
 "#,
         );
         let existing_snapshot = StarryCommandSnapshot {
             arch: Some("aarch64".to_string()),
             target: Some("aarch64-unknown-none-softfloat".to_string()),
             smp: None,
+            config: None,
             qemu: StarryQemuSnapshot {
-                qemu_config: Some(PathBuf::from("test-suit/starryos/smoke/qemu-riscv64.toml")),
+                qemu_config: Some(PathBuf::from(
+                    "test-suit/starryos/qemu/system/qemu-riscv64.toml",
+                )),
             },
             uboot: StarryUbootSnapshot {
                 uboot_config: Some(PathBuf::from("configs/uboot.toml")),
@@ -172,7 +188,7 @@ plat_dyn = false
         assert_eq!(
             path,
             root.path()
-                .join("target/axbuild/config/starryos/build-riscv64gc-unknown-none-elf.toml")
+                .join("tmp/axbuild/config/starryos/build-riscv64gc-unknown-none-elf.toml")
         );
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
@@ -186,13 +202,13 @@ plat_dyn = false
             Some("riscv64gc-unknown-none-elf")
         );
         assert_eq!(
-            snapshot.qemu.qemu_config,
-            Some(PathBuf::from("test-suit/starryos/smoke/qemu-riscv64.toml"))
+            snapshot.config,
+            Some(PathBuf::from(
+                "tmp/axbuild/config/starryos/build-riscv64gc-unknown-none-elf.toml"
+            ))
         );
-        assert_eq!(
-            snapshot.uboot.uboot_config,
-            Some(PathBuf::from("configs/uboot.toml"))
-        );
+        assert_eq!(snapshot.qemu.qemu_config, None);
+        assert_eq!(snapshot.uboot.uboot_config, None);
     }
 
     #[test]
@@ -204,10 +220,8 @@ plat_dyn = false
             "qemu-aarch64",
             r#"
 target = "aarch64-unknown-none-softfloat"
-env = { AX_IP = "10.0.2.15", AX_GW = "10.0.2.2" }
 features = ["qemu"]
 log = "Warn"
-plat_dyn = false
 "#,
         );
 
@@ -220,7 +234,34 @@ plat_dyn = false
     }
 
     #[test]
-    fn ensure_default_build_config_for_target_generates_missing_file_and_updates_snapshot() {
+    fn write_defconfig_copies_companion_its_with_matching_output_basename() {
+        let root = tempdir().unwrap();
+        write_workspace(root.path());
+        let source = write_board(
+            root.path(),
+            "licheerv-nano-sg2002",
+            r#"
+target = "riscv64gc-unknown-none-elf"
+features = [
+  "starry-kernel/sg2002",
+  "axplat-dyn/thead-mae",
+  "ax-driver/serial",
+]
+log = "Info"
+"#,
+        );
+        fs::write(source.with_extension("its"), "ITS_TEMPLATE").unwrap();
+
+        let build_config_path = write_defconfig(root.path(), "licheerv-nano-sg2002").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(build_config_path.with_extension("its")).unwrap(),
+            "ITS_TEMPLATE"
+        );
+    }
+
+    #[test]
+    fn ensure_default_build_config_for_target_generates_missing_file_without_changing_snapshot() {
         let root = tempdir().unwrap();
         write_workspace(root.path());
         let source = write_board(
@@ -228,16 +269,15 @@ plat_dyn = false
             "qemu-riscv64",
             r#"
 target = "riscv64gc-unknown-none-elf"
-env = { AX_IP = "10.0.2.15", AX_GW = "10.0.2.2" }
-features = ["qemu"]
+features = ["ax-driver/serial", "ax-driver/nvme"]
 log = "Warn"
-plat_dyn = false
 "#,
         );
         let existing_snapshot = StarryCommandSnapshot {
             arch: Some("aarch64".to_string()),
             target: Some("aarch64-unknown-none-softfloat".to_string()),
             smp: None,
+            config: None,
             qemu: StarryQemuSnapshot::default(),
             uboot: StarryUbootSnapshot::default(),
         };
@@ -258,11 +298,9 @@ plat_dyn = false
             fs::read_to_string(source).unwrap()
         );
 
-        let snapshot = StarryCommandSnapshot::load(root.path()).unwrap();
-        assert_eq!(snapshot.arch.as_deref(), Some("riscv64"));
         assert_eq!(
-            snapshot.target.as_deref(),
-            Some("riscv64gc-unknown-none-elf")
+            StarryCommandSnapshot::load(root.path()).unwrap(),
+            existing_snapshot
         );
     }
 
@@ -275,16 +313,14 @@ plat_dyn = false
             "qemu-aarch64",
             r#"
 target = "aarch64-unknown-none-softfloat"
-env = { AX_IP = "10.0.2.15", AX_GW = "10.0.2.2" }
 features = ["qemu"]
 log = "Warn"
-plat_dyn = false
 "#,
         );
 
         let output = root.path().join("tmp/custom-starry.toml");
         fs::create_dir_all(output.parent().unwrap()).unwrap();
-        fs::write(&output, "plat_dyn = true\n").unwrap();
+        fs::write(&output, "log = \"Debug\"\n").unwrap();
 
         let board = ensure_default_build_config_for_target(
             root.path(),
@@ -294,6 +330,6 @@ plat_dyn = false
         .unwrap();
 
         assert!(board.is_none());
-        assert_eq!(fs::read_to_string(&output).unwrap(), "plat_dyn = true\n");
+        assert_eq!(fs::read_to_string(&output).unwrap(), "log = \"Debug\"\n");
     }
 }

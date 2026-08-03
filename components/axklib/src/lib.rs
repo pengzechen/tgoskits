@@ -33,24 +33,73 @@
 //! // busy-wait for 100 microseconds
 //! axklib::time::busy_wait(core::time::Duration::from_micros(100));
 //!
-//! // register an IRQ handler
-//! axklib::irq::register(32, my_irq_handler);
+//! // request a shared IRQ action
+//! let irq = axklib::irq::try_legacy_irq(32)?;
+//! let handle = axklib::irq::request_shared(irq, my_irq_handler)?;
 //! ```
 
 #![no_std]
 // #![allow(missing_docs)]
 
+extern crate alloc;
+
 use core::time::Duration;
 
-pub use ax_errno::AxResult;
+pub use ax_errno::{AxError, AxResult};
 pub use ax_memory_addr::{PhysAddr, VirtAddr};
+pub use irq_framework::{
+    AutoEnable as IrqAutoEnable, BoxedIrqHandler, ConcurrentBoxedIrqHandler, CpuId as IrqCpuId,
+    CpuMask as IrqCpuMask, IrqAffinity, IrqContext, IrqError, IrqExecution, IrqHandle, IrqId,
+    IrqOutcome, IrqRequest, IrqReturn, IrqScope, IrqStatus, ShareMode as IrqShareMode,
+};
 use trait_ffi::*;
 
-/// A simple IRQ handler function pointer type.
-///
-/// This is a function that takes no arguments and returns nothing,
-/// used for handling interrupt requests (IRQs) in the kernel.
-pub type IrqHandler = fn();
+/// Compatibility IRQ domain used while non-domainized callers migrate.
+pub const LEGACY_IRQ_DOMAIN: irq_framework::IrqDomainId = irq_framework::IrqDomainId(0);
+
+/// Creates a legacy IRQ id without truncating the raw IRQ number.
+pub fn try_legacy_irq(raw: usize) -> Result<IrqId, IrqError> {
+    let hwirq = u32::try_from(raw).map_err(|_| IrqError::InvalidIrq)?;
+    Ok(IrqId::new(LEGACY_IRQ_DOMAIN, irq_framework::HwIrq(hwirq)))
+}
+
+/// Compatibility constructor for legacy numeric IRQ users.
+pub fn legacy_irq(raw: usize) -> Result<IrqId, IrqError> {
+    try_legacy_irq(raw)
+}
+
+/// Returns the legacy raw IRQ number when this id is in the legacy domain.
+pub const fn legacy_irq_raw(irq: IrqId) -> Option<usize> {
+    if irq.domain.0 == LEGACY_IRQ_DOMAIN.0 {
+        Some(irq.hwirq.0 as usize)
+    } else {
+        None
+    }
+}
+
+/// Legacy constructor kept only for upper-layer compatibility.
+#[allow(non_snake_case)]
+pub fn IrqNumber(raw: usize) -> Result<IrqId, IrqError> {
+    legacy_irq(raw)
+}
+
+/// Outcome of converting newly allocated coherent pages to an uncached mapping.
+#[must_use = "the outcome determines whether coherent pages can be reclaimed or must be quarantined"]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DmaCoherentMappingOutcome {
+    /// The mapping update and required cross-CPU synchronization completed.
+    Updated,
+    /// The mapping transaction did not start, so the allocated pages remain safe to reclaim.
+    NotStarted(AxError),
+    /// The mapping transaction started but its final cross-CPU state cannot be proven.
+    ///
+    /// Callers must quarantine the associated pages instead of returning them
+    /// to the allocator.
+    StateUncertain(AxError),
+}
+
+pub mod dma;
+pub mod mmio;
 
 /// The kernel helper trait that platform implementations must provide.
 #[def_extern_trait]
@@ -74,6 +123,51 @@ pub trait Klib {
     ///   is later cleaned up if the platform/ABI requires it.
     fn mem_iomap(addr: PhysAddr, size: usize) -> AxResult<VirtAddr>;
 
+    /// Translates a kernel virtual address to the corresponding physical address.
+    fn mem_virt_to_phys(addr: VirtAddr) -> PhysAddr;
+
+    /// Converts newly allocated DMA-coherent pages to an uncached kernel mapping.
+    ///
+    /// This is not a general-purpose memory attribute switching API. Callers
+    /// must only use it for pages that were just allocated for
+    /// `alloc_coherent`, are page-owned by that allocation, and have not been
+    /// exposed to another CPU, mapping, or device.
+    ///
+    /// Implementations must perform the required cache maintenance, TLB
+    /// invalidation, and ordering barriers internally. They must return
+    /// [`DmaCoherentMappingOutcome::NotStarted`] only when no mapping update
+    /// occurred and the pages remain safe to reclaim. Once an update may have
+    /// started, failures must return
+    /// [`DmaCoherentMappingOutcome::StateUncertain`] so callers quarantine the
+    /// pages.
+    fn mem_make_dma_coherent_uncached(addr: VirtAddr, size: usize) -> DmaCoherentMappingOutcome;
+
+    /// Restores DMA-coherent pages to a normal cacheable kernel mapping.
+    ///
+    /// The caller must ensure the device no longer owns or accesses the pages.
+    /// Implementations must perform the required TLB invalidation and ordering
+    /// barriers internally before the pages are returned to the normal page
+    /// allocator.
+    fn mem_restore_dma_cached(addr: VirtAddr, size: usize) -> AxResult;
+
+    /// Cleans a CPU cache range before device ownership.
+    fn dma_cache_clean(_addr: VirtAddr, _size: usize) {}
+
+    /// Invalidates a CPU cache range after device writes.
+    fn dma_cache_invalidate(_addr: VirtAddr, _size: usize) {}
+
+    /// Cleans and invalidates a CPU cache range for bidirectional DMA.
+    fn dma_cache_clean_invalidate(_addr: VirtAddr, _size: usize) {}
+
+    /// Allocates contiguous DMA pages.
+    ///
+    /// `dma_mask` is the device-visible address mask. Implementations should
+    /// use a DMA32-capable allocator when the mask requires it.
+    fn dma_alloc_pages(dma_mask: u64, num_pages: usize, align: usize) -> AxResult<VirtAddr>;
+
+    /// Releases pages previously allocated by [`Klib::dma_alloc_pages`].
+    fn dma_dealloc_pages(addr: VirtAddr, num_pages: usize);
+
     /// Busy-wait the current execution context for the provided duration.
     ///
     /// This is intended for short delays where sleeping or timer-based
@@ -83,32 +177,113 @@ pub trait Klib {
     /// are platform-dependent.
     fn time_busy_wait(dur: Duration);
 
-    /// Enable or disable the edge/level for a platform IRQ.
-    ///
-    /// `irq` is a platform IRQ number. `enabled` selects whether the IRQ
-    /// should be enabled (true) or disabled (false).
-    fn irq_set_enable(irq: usize, enabled: bool);
+    /// Returns monotonic time in nanoseconds.
+    fn time_monotonic_nanos() -> u64;
 
-    /// Register a simple IRQ handler for the given IRQ number.
+    /// Initializes the wall-clock epoch offset from an absolute epoch time.
+    fn time_try_init_epoch_offset(epoch_time_nanos: u64) -> bool;
+
+    /// Enable or disable a domain-scoped platform IRQ.
+    fn irq_set_enable(irq: IrqId, enabled: bool) -> AxResult;
+
+    /// Request a shared IRQ action and return its handle on success.
+    fn irq_request_shared(irq: IrqId, handler: BoxedIrqHandler) -> AxResult<IrqHandle>;
+
+    /// Request a shared IRQ action without enabling it.
+    fn irq_request_shared_disabled(irq: IrqId, handler: BoxedIrqHandler) -> AxResult<IrqHandle>;
+
+    /// Request a per-CPU IRQ action and return its handle on success.
+    fn irq_request_percpu(
+        irq: IrqId,
+        cpus: IrqCpuMask,
+        handler: ConcurrentBoxedIrqHandler,
+    ) -> AxResult<IrqHandle>;
+
+    /// Free an IRQ action previously returned by a request function.
+    fn irq_free(handle: IrqHandle) -> AxResult;
+
+    /// Enable an IRQ action by handle.
+    fn irq_enable(handle: IrqHandle) -> AxResult;
+
+    /// Disable an IRQ action by handle.
+    fn irq_disable(handle: IrqHandle) -> AxResult;
+
+    /// Runs a raw thunk synchronously on the requested CPU.
     ///
-    /// Returns `true` if the handler was successfully registered, `false`
-    /// otherwise. The exact semantics (e.g. whether multiple handlers are
-    /// allowed) are platform-specific; callers should consult the platform
-    /// implementation.
-    fn irq_register(irq: usize, handler: IrqHandler) -> bool;
+    /// This is an owner-context bridge for driver runtimes that must keep all
+    /// register access on a fixed CPU. Platform glue should override this when
+    /// cross-CPU IPI execution is available.
+    ///
+    /// # Safety
+    ///
+    /// `arg` must stay valid until the function returns, and `f` must be safe
+    /// to execute in the target CPU's IRQ/IPI context.
+    unsafe fn irq_run_on_cpu_sync(
+        cpu: IrqCpuId,
+        f: unsafe fn(*mut ()),
+        arg: *mut (),
+    ) -> Result<(), IrqError> {
+        if cpu.0 == 0 {
+            unsafe { f(arg) };
+            Ok(())
+        } else {
+            Err(IrqError::Unsupported)
+        }
+    }
 }
 
 /// Convenience re-export for memory IO mapping.
 pub mod mem {
-    pub use super::klib::mem_iomap as iomap;
+    pub use super::klib::{
+        mem_iomap as iomap, mem_make_dma_coherent_uncached as make_dma_coherent_uncached,
+        mem_restore_dma_cached as restore_dma_cached, mem_virt_to_phys as virt_to_phys,
+    };
 }
 
 /// Convenience re-export for busy-wait timing.
 pub mod time {
-    pub use super::klib::time_busy_wait as busy_wait;
+    pub use super::klib::{
+        time_busy_wait as busy_wait, time_monotonic_nanos as monotonic_nanos,
+        time_try_init_epoch_offset as try_init_epoch_offset,
+    };
 }
 
 /// Convenience re-exports for IRQ operations.
 pub mod irq {
-    pub use super::klib::{irq_register as register, irq_set_enable as set_enable};
+    pub use super::{
+        BoxedIrqHandler, ConcurrentBoxedIrqHandler, IrqAffinity, IrqAutoEnable as AutoEnable,
+        IrqContext, IrqCpuId as CpuId, IrqCpuMask as CpuMask, IrqError, IrqExecution, IrqHandle,
+        IrqId, IrqNumber, IrqOutcome, IrqRequest, IrqReturn, IrqScope, IrqShareMode as ShareMode,
+        IrqStatus,
+        klib::{
+            irq_disable as disable, irq_enable as enable, irq_free as free,
+            irq_run_on_cpu_sync as run_on_cpu_sync, irq_set_enable as set_enable,
+        },
+        legacy_irq, legacy_irq_raw, try_legacy_irq,
+    };
+
+    /// Request a shared IRQ action and return its handle on success.
+    pub fn request_shared(
+        irq: IrqId,
+        handler: impl FnMut(IrqContext) -> IrqReturn + Send + 'static,
+    ) -> super::AxResult<IrqHandle> {
+        super::klib::irq_request_shared(irq, alloc::boxed::Box::new(handler))
+    }
+
+    /// Request a shared IRQ action without enabling it.
+    pub fn request_shared_disabled(
+        irq: IrqId,
+        handler: impl FnMut(IrqContext) -> IrqReturn + Send + 'static,
+    ) -> super::AxResult<IrqHandle> {
+        super::klib::irq_request_shared_disabled(irq, alloc::boxed::Box::new(handler))
+    }
+
+    /// Request a per-CPU IRQ action and return its handle on success.
+    pub fn request_percpu(
+        irq: IrqId,
+        cpus: CpuMask,
+        handler: impl Fn(IrqContext) -> IrqReturn + Send + Sync + 'static,
+    ) -> super::AxResult<IrqHandle> {
+        super::klib::irq_request_percpu(irq, cpus, alloc::boxed::Box::new(handler))
+    }
 }

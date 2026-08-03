@@ -4,11 +4,14 @@ include = [{path = "../../../.cargo/.config-local.toml", optional = true}]
 # 使用系统 git 拉取依赖，可利用已配置的 git 凭证（如 gh auth、credential helper）
 git-fetch-with-cli = true
 
+[profile.release]
+lto = true
+
 [target.x86_64-unknown-none]
 rustflags = [
     "-Clink-args=-no-pie",
     "-Clink-args=-znostart-stop-gc",
-    "-Clink-args=-Tlink.x",
+    "-Clink-args=-Tlinker.x",
 ]
 
 # Comment out because it's specified by runner in tgoskits
@@ -17,18 +20,18 @@ rustflags = [
 #     "-Crelocation-model=pic",
 #     "-Clink-args=-pie",
 #     "-Clink-args=-znostart-stop-gc",
-#     "-Clink-args=-Taxplat.x",
+#     "-Clink-args=-Tlinker.x",
 # ]
 
 [target.riscv64gc-unknown-none-elf]
 rustflags = [
     "-Clink-args=-no-pie",
     "-Clink-args=-znostart-stop-gc",
-    "-Clink-args=-Tlink.x",
+    "-Clink-args=-Tlinker.x",
 ]
 
 [target.'cfg(target_os = "none")']
 runner = "cargo osrun"
 
 [alias]
-xtask = "run --bin xtask --"
+xtask = "run --features host-xtask --bin xtask --"

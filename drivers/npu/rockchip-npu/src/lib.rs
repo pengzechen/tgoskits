@@ -90,6 +90,7 @@ pub struct Rknpu {
     dma: DeviceDma,
     iommu_enabled: bool,
     pub(crate) gem: GemPool,
+    pub(crate) auto_core_cursor: usize,
 }
 
 impl Rknpu {
@@ -113,11 +114,16 @@ impl Rknpu {
             dma: dma.clone(),
             iommu_enabled: false,
             gem: GemPool::new(dma),
+            auto_core_cursor: 0,
         }
     }
 
     pub fn dma(&self) -> &DeviceDma {
         &self.dma
+    }
+
+    pub fn mem_sync(&mut self, args: &mut ioctrl::RknpuMemSync) -> Result<(), RknpuError> {
+        self.gem.sync(args)
     }
 
     pub fn open(&mut self) -> Result<(), RknpuError> {

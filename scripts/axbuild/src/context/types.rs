@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use super::snapshot::{CommandSnapshotFile, load_snapshot, store_snapshot};
-use crate::arceos::build::ArceosBuildInfo;
+use crate::build::BuildInfo;
 
 pub const ARCEOS_SNAPSHOT_FILE: &str = ".arceos.toml";
 pub const DEFAULT_ARCEOS_ARCH: &str = "aarch64";
@@ -22,7 +22,6 @@ pub struct BuildCliArgs {
     pub package: Option<String>,
     pub arch: Option<String>,
     pub target: Option<String>,
-    pub plat_dyn: Option<bool>,
     pub smp: Option<usize>,
     pub debug: bool,
 }
@@ -41,7 +40,6 @@ pub struct AxvisorCliArgs {
     pub config: Option<PathBuf>,
     pub arch: Option<String>,
     pub target: Option<String>,
-    pub plat_dyn: Option<bool>,
     pub smp: Option<usize>,
     pub debug: bool,
     pub vmconfigs: Vec<PathBuf>,
@@ -68,9 +66,9 @@ pub struct ArceosCommandSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plat_dyn: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub smp: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "ArceosQemuSnapshot::is_empty")]
     pub qemu: ArceosQemuSnapshot,
     #[serde(default, skip_serializing_if = "ArceosUbootSnapshot::is_empty")]
@@ -82,7 +80,6 @@ pub struct ResolvedBuildRequest {
     pub package: String,
     pub arch: String,
     pub target: String,
-    pub plat_dyn: Option<bool>,
     pub smp: Option<usize>,
     pub debug: bool,
     pub build_info_path: PathBuf,
@@ -109,8 +106,6 @@ pub struct AxvisorCommandSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plat_dyn: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub smp: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<PathBuf>,
@@ -128,7 +123,6 @@ pub struct ResolvedAxvisorRequest {
     pub axvisor_dir: PathBuf,
     pub arch: String,
     pub target: String,
-    pub plat_dyn: Option<bool>,
     pub smp: Option<usize>,
     pub debug: bool,
     pub build_info_path: PathBuf,
@@ -157,6 +151,8 @@ pub struct StarryCommandSnapshot {
     pub target: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub smp: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "StarryQemuSnapshot::is_empty")]
     pub qemu: StarryQemuSnapshot,
     #[serde(default, skip_serializing_if = "StarryUbootSnapshot::is_empty")]
@@ -168,11 +164,10 @@ pub struct ResolvedStarryRequest {
     pub package: String,
     pub arch: String,
     pub target: String,
-    pub plat_dyn: Option<bool>,
     pub smp: Option<usize>,
     pub debug: bool,
     pub build_info_path: PathBuf,
-    pub build_info_override: Option<ArceosBuildInfo>,
+    pub build_info_override: Option<BuildInfo>,
     pub qemu_config: Option<PathBuf>,
     pub uboot_config: Option<PathBuf>,
 }

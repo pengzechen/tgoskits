@@ -89,9 +89,21 @@ pub unsafe fn init_mmu(root_paddr: PhysAddr) {
     // Flush the entire TLB
     crate::asm::flush_tlb(None);
 
-    // Enable the MMU and turn on I-cache and D-cache
-    SCTLR_EL1.modify(SCTLR_EL1::M::Enable + SCTLR_EL1::C::Cacheable + SCTLR_EL1::I::Cacheable);
-    // Disable SPAN
+    // Enable the MMU, I/D cache, and EL0-accessible cache instructions.
+    // UCT/DZE/UCI let userspace execute `MRS CTR_EL0`, `DC ZVA`, and
+    // `DC CVAU` / `IC IVAU`. musl, glibc, and Mesa emit these
+    // unconditionally during early process startup. Without them, the
+    // first userspace cache-line lookup traps as EC=0x18 and the process
+    // dies with SIGTRAP before reaching `main()`.
+    SCTLR_EL1.modify(
+        SCTLR_EL1::M::Enable
+            + SCTLR_EL1::C::Cacheable
+            + SCTLR_EL1::I::Cacheable
+            + SCTLR_EL1::UCT::DontTrap
+            + SCTLR_EL1::DZE::DontTrap
+            + SCTLR_EL1::UCI::DontTrap,
+    );
+    // Disable SPAN (bit 23; not exposed as a named field by aarch64-cpu).
     SCTLR_EL1.set(SCTLR_EL1.get() | (1 << 23));
     barrier::isb(barrier::SY);
 }
@@ -101,8 +113,26 @@ pub unsafe fn init_mmu(root_paddr: PhysAddr) {
 /// In detail, it initializes the exception vector, and sets `TTBR0_EL1` to 0 to
 /// block low address access.
 pub fn init_trap() {
+    #[cfg(feature = "exception-table")]
+    crate::exception_table::init_exception_table();
     #[cfg(feature = "uspace")]
-    crate::uspace_common::init_exception_table();
+    {
+        CNTKCTL_EL1.modify(CNTKCTL_EL1::EL0VCTEN::TrappedNone + CNTKCTL_EL1::EL0PCTEN::TrappedNone);
+        // Start this CPU's free-running PMU cycle counter and let EL0 read it, so
+        // `PMCCNTR_EL0` yields real cycle counts at both EL1 and EL0. This is the
+        // exact-frequency oracle the DVFS calibration reads in-kernel and that
+        // `cpuprobe`'s `mhz_pmc` reads from userspace (both were 0/trapping before,
+        // because these registers were only ever set on the lazy perf_event_open
+        // path). Guarded on PMUv3 being present; a live system-wide `perf stat -e
+        // cycles` may momentarily reset/disable this shared counter, which is fine
+        // for a boot/idle calibration.
+        if crate::pmu::probe().is_some() {
+            crate::pmu::init_cpu();
+            crate::pmu::cycles::configure(false, false);
+            crate::pmu::cycles::enable();
+        }
+        barrier::isb(barrier::SY);
+    }
     unsafe extern "C" {
         fn exception_vector_base();
     }

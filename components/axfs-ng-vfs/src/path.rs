@@ -9,7 +9,8 @@ pub const DOTDOT: &str = "..";
 pub const MAX_NAME_LEN: usize = 255;
 
 pub(crate) fn verify_entry_name(name: &str) -> VfsResult<()> {
-    if name == DOT || name == DOTDOT {
+    let is_reserved = name == DOT || name == DOTDOT;
+    if name.is_empty() || is_reserved || name.contains('/') || name.contains('\0') {
         return Err(VfsError::InvalidInput);
     }
     if name.len() > MAX_NAME_LEN {
@@ -160,6 +161,16 @@ impl Path {
 
     pub fn as_bytes(&self) -> &[u8] {
         self.inner.as_bytes()
+    }
+
+    /// Returns true if pathname has a trailing slash (other than the root
+    /// path "/" itself). POSIX requires that such paths refer to a directory;
+    /// callers should check `!loc.is_dir()` and return ENOTDIR. The trailing
+    /// slash is stripped at the Components iterator layer (parse_forward
+    /// drops empty trailing components), so this method preserves the
+    /// otherwise-lost signal.
+    pub fn has_trailing_slash(&self) -> bool {
+        self.inner.len() > 1 && self.inner.ends_with('/')
     }
 
     /// Produces an iterator over the [`Components`] of the path.
@@ -406,5 +417,24 @@ mod test {
         assert_eq!(Some("c"), Path::new("../a/b/c").file_name());
         assert_eq!(Some("b"), Path::new("a/b/.").file_name());
         assert_eq!(None, Path::new("a/..").file_name());
+    }
+
+    #[test]
+    fn verify_entry_name_rejects_invalid_components() {
+        for name in ["", DOT, DOTDOT, "a/b", "a\0b"] {
+            assert_eq!(verify_entry_name(name), Err(VfsError::InvalidInput));
+        }
+    }
+
+    #[test]
+    fn verify_entry_name_rejects_overlong_component() {
+        let name = "a".repeat(MAX_NAME_LEN + 1);
+
+        assert_eq!(verify_entry_name(&name), Err(VfsError::NameTooLong));
+    }
+
+    #[test]
+    fn verify_entry_name_accepts_regular_component() {
+        assert_eq!(verify_entry_name("file"), Ok(()));
     }
 }

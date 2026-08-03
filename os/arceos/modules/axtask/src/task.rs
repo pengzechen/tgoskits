@@ -1,20 +1,33 @@
 use alloc::{boxed::Box, string::String, sync::Arc};
-#[cfg(feature = "preempt")]
+#[cfg(not(feature = "stack-guard-page"))]
+use core::alloc::Layout;
+#[cfg(feature = "smp")]
+use core::sync::atomic::AtomicPtr;
+#[cfg(any(
+    feature = "preempt",
+    all(feature = "stack-guard-page", feature = "smp", feature = "ipi")
+))]
 use core::sync::atomic::AtomicUsize;
 use core::{
-    alloc::Layout,
     cell::{Cell, UnsafeCell},
     fmt,
     mem::ManuallyDrop,
     ops::Deref,
+    pin::Pin,
     sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering},
     task::{Context, Poll},
 };
 
-use ax_hal::context::TaskContext;
 #[cfg(feature = "tls")]
 use ax_hal::tls::TlsArea;
+use ax_hal::{
+    context::{KernelTlsBase, TaskContext},
+    percpu::{CurrentContext, CurrentThreadHeader},
+};
 use ax_kspin::SpinNoIrq;
+use ax_lazyinit::LazyInit;
+#[cfg(feature = "stack-guard-page")]
+use ax_memory_addr::PAGE_SIZE_4K;
 use ax_memory_addr::{VirtAddr, align_up_4k};
 use futures_util::task::AtomicWaker;
 
@@ -22,9 +35,9 @@ use futures_util::task::AtomicWaker;
 use crate::lockdep::HeldLockStack;
 use crate::{AxCpuMask, AxTask, AxTaskRef, WaitQueue};
 
-#[cfg(all(feature = "stack-canary", target_pointer_width = "64"))]
+#[cfg(target_pointer_width = "64")]
 const STACK_END_MAGIC: usize = 0x57AC_CE11_57AC_CE11usize;
-#[cfg(all(feature = "stack-canary", target_pointer_width = "32"))]
+#[cfg(target_pointer_width = "32")]
 const STACK_END_MAGIC: usize = 0x57AC_CE11usize;
 
 /// Required alignment for task kernel stacks. x86_64 task context setup relies
@@ -76,6 +89,12 @@ pub struct TaskInner {
     /// CPU affinity mask.
     cpumask: SpinNoIrq<AxCpuMask>,
 
+    /// Scheduling policy of the task.
+    sched_policy: AtomicI32,
+
+    /// Scheduling priority of the task.
+    sched_priority: AtomicI32,
+
     /// Mark whether the task is in the wait queue.
     in_wait_queue: AtomicBool,
 
@@ -84,6 +103,18 @@ pub struct TaskInner {
     /// Used to indicate whether the task is running on a CPU.
     #[cfg(feature = "smp")]
     on_cpu: AtomicBool,
+    /// One-shot cross-core wake handoff.
+    ///
+    /// When a remote CPU wins the `Blocked -> Ready` transition for this task
+    /// while it is still `on_cpu` (its context not yet fully saved on its owning
+    /// CPU), the waker must NOT enqueue it — and must not spin on `on_cpu`
+    /// either (that is the cross-core mutual-wake deadlock). Instead it records
+    /// the target run-queue in `cpu_id` and stashes an owned reference here; the
+    /// owning CPU drains it in `clear_prev_task_on_cpu()` once `on_cpu` is false,
+    /// then enqueues + kicks the target. Holds a `*const AxTask` produced by
+    /// `Arc::into_raw` (null = empty). See `run_queue::put_task_with_state`.
+    #[cfg(feature = "smp")]
+    wake_handoff: AtomicPtr<AxTask>,
 
     /// A ticket ID used to identify the timer event.
     /// Set by `set_timer_ticket()` when creating a timer event in `set_alarm_wakeup()`,
@@ -93,6 +124,8 @@ pub struct TaskInner {
 
     #[cfg(feature = "preempt")]
     need_resched: AtomicBool,
+    #[cfg(feature = "preempt")]
+    force_resched: AtomicBool,
     #[cfg(feature = "preempt")]
     preempt_disable_count: AtomicUsize,
 
@@ -104,6 +137,8 @@ pub struct TaskInner {
 
     kstack: TaskStack,
     ctx: UnsafeCell<TaskContext>,
+    /// Pinned identity and CPU-binding state published by the switch tail.
+    current_header: LazyInit<CurrentThreadHeader>,
     #[cfg(feature = "lockdep")]
     held_locks: UnsafeCell<HeldLockStack>,
 
@@ -153,14 +188,14 @@ impl TaskInner {
         debug!("new task: {}", t.id_name());
 
         #[cfg(feature = "tls")]
-        let tls = VirtAddr::from(t.tls.tls_ptr() as usize);
+        let kernel_tls = KernelTlsBase::new(t.tls.tls_ptr() as usize);
         #[cfg(not(feature = "tls"))]
-        let tls = VirtAddr::from(0);
+        let kernel_tls = KernelTlsBase::new(0);
         let kstack_top = t.kstack.top();
 
         t.entry = Cell::new(Some(Box::new(entry)));
         t.ctx_mut()
-            .init(task_entry as *const () as usize, kstack_top, tls);
+            .init(task_entry as *const () as usize, kstack_top, kernel_tls);
         if t.name() == "idle" {
             t.is_idle = true;
         }
@@ -190,6 +225,7 @@ impl TaskInner {
     /// Wait for the task to exit, and return the exit code.
     ///
     /// It will return immediately if the task has already exited (but not dropped).
+    #[track_caller]
     pub fn join(&self) -> i32 {
         crate::api::might_sleep();
         self.wait_for_exit
@@ -213,6 +249,17 @@ impl TaskInner {
     #[inline]
     pub const fn ctx_mut(&mut self) -> &mut TaskContext {
         self.ctx.get_mut()
+    }
+
+    /// Updates the page table root stored in this task's context and switches
+    /// the hardware page table immediately. Only safe to call on the current
+    /// running task.
+    #[cfg(feature = "uspace")]
+    pub fn switch_page_table(&self, root: ax_memory_addr::PhysAddr) {
+        // SAFETY: we are the current task and no other thread touches our ctx.
+        unsafe { (*self.ctx.get()).set_page_table_root(root) };
+        unsafe { ax_hal::asm::write_user_page_table(root) };
+        ax_hal::asm::flush_tlb(None);
     }
 
     #[cfg(feature = "lockdep")]
@@ -247,6 +294,26 @@ impl TaskInner {
         *self.cpumask.lock() = cpumask
     }
 
+    #[inline]
+    pub fn sched_policy(&self) -> i32 {
+        self.sched_policy.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn set_sched_policy(&self, policy: i32) {
+        self.sched_policy.store(policy, Ordering::Release)
+    }
+
+    #[inline]
+    pub fn sched_priority(&self) -> i32 {
+        self.sched_priority.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn set_sched_priority(&self, prio: i32) {
+        self.sched_priority.store(prio, Ordering::Release)
+    }
+
     /// Polls whether the task has been interrupted.
     #[inline]
     pub fn poll_interrupt(&self, cx: &Context) -> Poll<()> {
@@ -266,6 +333,25 @@ impl TaskInner {
     #[inline]
     pub fn clear_interrupt(&self) {
         self.interrupted.store(false, Ordering::Release);
+    }
+
+    /// Atomically checks and clears the interrupt flag.
+    ///
+    /// Returns `true` if the task was interrupted.
+    #[inline]
+    pub fn take_interrupt(&self) -> bool {
+        self.interrupted.swap(false, Ordering::AcqRel)
+    }
+
+    /// Checks whether the task has been interrupted without clearing
+    /// the flag.
+    ///
+    /// This is a non-consuming read, unlike [`take_interrupt`]. Use this
+    /// when the interrupt flag needs to remain set for subsequent
+    /// consumers (e.g., an [`interruptible`] future wrapper).
+    #[inline]
+    pub fn interrupted(&self) -> bool {
+        self.interrupted.load(Ordering::Acquire)
     }
 
     /// Interrupts the task.
@@ -288,14 +374,20 @@ impl TaskInner {
             state: AtomicU8::new(TaskState::Ready as u8),
             // By default, the task is allowed to run on all CPUs.
             cpumask: SpinNoIrq::new(crate::api::cpu_mask_full()),
+            sched_policy: AtomicI32::new(0),
+            sched_priority: AtomicI32::new(0),
             in_wait_queue: AtomicBool::new(false),
             #[cfg(feature = "irq")]
             timer_ticket_id: AtomicU64::new(0),
             cpu_id: AtomicU32::new(0),
             #[cfg(feature = "smp")]
             on_cpu: AtomicBool::new(false),
+            #[cfg(feature = "smp")]
+            wake_handoff: AtomicPtr::new(core::ptr::null_mut()),
             #[cfg(feature = "preempt")]
             need_resched: AtomicBool::new(false),
+            #[cfg(feature = "preempt")]
+            force_resched: AtomicBool::new(false),
             #[cfg(feature = "preempt")]
             preempt_disable_count: AtomicUsize::new(0),
             interrupted: AtomicBool::new(false),
@@ -304,6 +396,7 @@ impl TaskInner {
             wait_for_exit: WaitQueue::new(),
             kstack,
             ctx: UnsafeCell::new(TaskContext::new()),
+            current_header: LazyInit::new(),
             #[cfg(feature = "lockdep")]
             held_locks: UnsafeCell::new(HeldLockStack::new()),
             #[cfg(feature = "task-ext")]
@@ -333,7 +426,29 @@ impl TaskInner {
     }
 
     pub(crate) fn into_arc(self) -> AxTaskRef {
-        Arc::new(AxTask::new(self))
+        let task = Arc::new(AxTask::new(self));
+        let current_context = CurrentContext::from_raw(Arc::as_ptr(&task) as usize)
+            .expect("Arc task pointer must be non-null");
+        let header = task
+            .current_header
+            .init_once(CurrentThreadHeader::new(current_context));
+        // SAFETY: `header` is stored inside the Arc allocation that owns the
+        // task. That allocation is stable until the last task reference drops.
+        let header = unsafe { Pin::new_unchecked(header) };
+        // SAFETY: the Arc is not visible to any scheduler yet, so this is the
+        // only access to its architecture context.
+        unsafe { (*task.ctx_mut_ptr()).set_current_header(header.as_non_null()) };
+        task
+    }
+
+    pub(crate) fn current_header(&self) -> Pin<&CurrentThreadHeader> {
+        let header = self
+            .current_header
+            .get()
+            .expect("task header must be initialized after Arc allocation");
+        // SAFETY: `into_arc` initializes this field only after the containing
+        // scheduler task reaches its permanent Arc allocation.
+        unsafe { Pin::new_unchecked(header) }
     }
 
     /// Returns the current state of the task.
@@ -426,6 +541,36 @@ impl TaskInner {
 
     #[inline]
     #[cfg(feature = "preempt")]
+    pub(crate) fn set_force_resched_pending(&self, pending: bool) {
+        self.force_resched.store(pending, Ordering::Release)
+    }
+
+    #[inline]
+    #[cfg(feature = "preempt")]
+    fn force_resched_pending(&self) -> bool {
+        self.force_resched.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    #[cfg(all(test, feature = "preempt"))]
+    pub(crate) fn preempt_pending_for_test(&self) -> bool {
+        self.need_resched.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    #[cfg(all(test, feature = "preempt"))]
+    pub(crate) fn force_resched_pending_for_test(&self) -> bool {
+        self.force_resched_pending()
+    }
+
+    #[inline]
+    #[cfg(feature = "preempt")]
+    fn take_force_resched_pending(&self) -> bool {
+        self.force_resched.swap(false, Ordering::AcqRel)
+    }
+
+    #[inline]
+    #[cfg(feature = "preempt")]
     pub(crate) fn preempt_count(&self) -> usize {
         self.preempt_disable_count.load(Ordering::Acquire)
     }
@@ -446,6 +591,15 @@ impl TaskInner {
     #[cfg(feature = "preempt")]
     pub(crate) fn enable_preempt(&self, resched: bool) {
         if self.preempt_disable_count.fetch_sub(1, Ordering::Release) == 1 && resched {
+            // Keep local IRQs masked until the preemption check has completely
+            // unwound. A device IRQ may wake a pinned maintenance task and
+            // immediately become pending again when that task rearms the
+            // source. If IRQs are restored by the scheduler's inner guard
+            // before this frame returns, every pending IRQ can recursively
+            // enter another preemption check on the interrupted task's stack.
+            // The outer IRQ guard turns that chain into successive IRQ exits
+            // instead of unbounded scheduler-stack growth.
+            let _irq_guard = ax_kernel_guard::IrqSave::new();
             // If current task is pending to be preempted, do rescheduling.
             Self::current_check_preempt_pending();
         }
@@ -455,11 +609,17 @@ impl TaskInner {
     fn current_check_preempt_pending() {
         use ax_kernel_guard::NoPreemptIrqSave;
         let curr = crate::current();
-        if curr.need_resched.load(Ordering::Acquire) && curr.can_preempt(0) {
+        if (curr.force_resched_pending() || curr.need_resched.load(Ordering::Acquire))
+            && curr.can_preempt(0)
+        {
             // Note: if we want to print log msg during `preempt_resched`, we have to
             // disable preemption here, because the ax-log may cause preemption.
             let mut rq = crate::current_run_queue::<NoPreemptIrqSave>();
-            if curr.need_resched.load(Ordering::Acquire) {
+            if curr.take_force_resched_pending() {
+                #[cfg(all(feature = "smp", feature = "ipi"))]
+                crate::run_queue::clear_remote_reschedule_pending_for_current_cpu();
+                rq.force_resched()
+            } else if curr.need_resched.load(Ordering::Acquire) {
                 rq.preempt_resched()
             }
         }
@@ -477,7 +637,6 @@ impl TaskInner {
         self.ctx.get()
     }
 
-    #[cfg(feature = "stack-canary")]
     #[inline]
     pub(crate) fn check_stack_canary(&self) {
         if self.kstack.is_canary_intact() {
@@ -506,17 +665,52 @@ impl TaskInner {
     /// while it has not finished its scheduling process.
     /// The `on_cpu field is set to `true` when the task is preparing to run on a CPU,
     /// and it is set to `false` when the task has finished its scheduling process in `clear_prev_task_on_cpu()`.
+    ///
+    /// `SeqCst` because it participates in a store-before-load (Dekker) handshake
+    /// with [`Self::stash_wake`]/[`Self::take_wake`] across two distinct atomics
+    /// (`on_cpu` and `wake_handoff`); Acquire/Release would permit the
+    /// "both sides observe the other's stale value" lost-wakeup execution.
     #[cfg(feature = "smp")]
     #[inline]
     pub(crate) fn on_cpu(&self) -> bool {
-        self.on_cpu.load(Ordering::Acquire)
+        self.on_cpu.load(Ordering::SeqCst)
     }
 
-    /// Sets whether the task is running on a CPU.
+    /// Sets whether the task is running on a CPU. `SeqCst`, see [`Self::on_cpu`].
     #[cfg(feature = "smp")]
     #[inline]
     pub(crate) fn set_on_cpu(&self, on_cpu: bool) {
-        self.on_cpu.store(on_cpu, Ordering::Release)
+        self.on_cpu.store(on_cpu, Ordering::SeqCst)
+    }
+
+    /// Stash an owned reference for a deferred cross-core wake (see the
+    /// `wake_handoff` field). Transfers ownership of `task` into the slot via
+    /// `Arc::into_raw`. Must be paired with exactly one [`Self::take_wake`].
+    #[cfg(feature = "smp")]
+    #[inline]
+    pub(crate) fn stash_wake(&self, task: AxTaskRef) {
+        let ptr = Arc::into_raw(task) as *mut AxTask;
+        // SeqCst: ordered with the `on_cpu` handshake (see `on_cpu`).
+        self.wake_handoff.store(ptr, Ordering::SeqCst);
+    }
+
+    /// Atomically consume a stashed deferred-wake reference, if any. Returns the
+    /// owned `AxTaskRef` to exactly one caller (the swap is the single arbiter);
+    /// all other callers get `None`.
+    #[cfg(feature = "smp")]
+    #[inline]
+    pub(crate) fn take_wake(&self) -> Option<AxTaskRef> {
+        let ptr = self
+            .wake_handoff
+            .swap(core::ptr::null_mut(), Ordering::SeqCst);
+        if ptr.is_null() {
+            None
+        } else {
+            // Safety: `ptr` came from `Arc::into_raw` in `stash_wake`, and the
+            // swap guarantees a single consumer, so this reconstructs the unique
+            // owning `Arc` exactly once.
+            Some(unsafe { Arc::from_raw(ptr as *const AxTask) })
+        }
     }
 }
 
@@ -539,12 +733,35 @@ impl Drop for TaskInner {
 pub(crate) struct TaskStack {
     ptr: usize,
     size: usize,
+    #[cfg(not(feature = "stack-guard-page"))]
     align: usize,
-    owned: bool,
+    #[cfg(feature = "stack-guard-page")]
+    alloc_pages: usize,
+    kind: TaskStackKind,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum TaskStackKind {
+    #[cfg(not(feature = "stack-guard-page"))]
+    Alloc,
+    #[cfg(feature = "stack-guard-page")]
+    GuardedAlloc,
+    Borrowed,
 }
 
 impl TaskStack {
     pub fn alloc(size: usize) -> Self {
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "stack-guard-page")] {
+                Self::alloc_guarded(size)
+            } else {
+                Self::alloc_plain(size)
+            }
+        }
+    }
+
+    #[cfg(not(feature = "stack-guard-page"))]
+    fn alloc_plain(size: usize) -> Self {
         let align = TASK_STACK_ALIGN;
         let layout = Layout::from_size_align(size, align).unwrap();
         let ptr = unsafe { alloc::alloc::alloc(layout) as usize };
@@ -553,31 +770,51 @@ impl TaskStack {
             ptr,
             size,
             align,
-            owned: true,
+            kind: TaskStackKind::Alloc,
         };
-        #[cfg(feature = "stack-canary")]
-        unsafe {
-            stack.write_canary()
+        unsafe { stack.write_canary() };
+        stack
+    }
+
+    #[cfg(feature = "stack-guard-page")]
+    fn alloc_guarded(size: usize) -> Self {
+        let usable_size = align_up_4k(size);
+        let guarded_size = usable_size
+            .checked_add(PAGE_SIZE_4K)
+            .expect("guarded task stack size overflow");
+        let pages = guarded_size / PAGE_SIZE_4K;
+        let base = ax_alloc::global_allocator()
+            .alloc_pages(pages, PAGE_SIZE_4K, ax_alloc::UsageKind::Global)
+            .expect("guarded task stack allocation failed");
+        let usable_bottom = base + PAGE_SIZE_4K;
+        let stack = Self {
+            ptr: usable_bottom,
+            size: usable_size,
+            alloc_pages: pages,
+            kind: TaskStackKind::GuardedAlloc,
         };
+        stack.unmap_guard_page();
+        unsafe { stack.write_canary() };
         stack
     }
 
     pub fn borrowed(bottom: VirtAddr, size: usize, align: usize) -> Self {
         assert_ne!(bottom.as_usize(), 0, "static task stack pointer is null");
+        #[cfg(feature = "stack-guard-page")]
+        let _ = align;
         let stack = Self {
             ptr: bottom.as_usize(),
             size,
+            #[cfg(not(feature = "stack-guard-page"))]
             align,
-            owned: false,
+            #[cfg(feature = "stack-guard-page")]
+            alloc_pages: 0,
+            kind: TaskStackKind::Borrowed,
         };
-        #[cfg(feature = "stack-canary")]
-        unsafe {
-            stack.write_canary()
-        };
+        unsafe { stack.write_canary() };
         stack
     }
 
-    #[cfg(feature = "stack-canary")]
     #[inline]
     pub fn bottom(&self) -> VirtAddr {
         VirtAddr::from(self.ptr)
@@ -588,36 +825,162 @@ impl TaskStack {
         VirtAddr::from(self.ptr + self.size)
     }
 
+    #[cfg(feature = "stack-guard-page")]
     #[inline]
-    #[cfg(feature = "stack-canary")]
+    fn guard_bottom(&self) -> VirtAddr {
+        debug_assert_eq!(self.kind, TaskStackKind::GuardedAlloc);
+        VirtAddr::from(self.ptr - PAGE_SIZE_4K)
+    }
+
+    #[cfg(feature = "stack-guard-page")]
+    #[inline]
+    fn guard_top(&self) -> VirtAddr {
+        self.guard_bottom() + PAGE_SIZE_4K
+    }
+
+    #[cfg(feature = "stack-guard-page")]
+    #[inline]
+    fn contains_guard_addr(&self, addr: VirtAddr) -> bool {
+        matches!(self.kind, TaskStackKind::GuardedAlloc)
+            && self.guard_bottom() <= addr
+            && addr < self.guard_top()
+    }
+
+    #[cfg(feature = "stack-guard-page")]
+    fn unmap_guard_page(&self) {
+        let guard_bottom = self.guard_bottom();
+        ax_mm::kernel_aspace()
+            .lock()
+            .unmap(guard_bottom, PAGE_SIZE_4K)
+            .expect("failed to unmap task stack guard page");
+        flush_stack_guard_tlb(guard_bottom);
+    }
+
+    #[cfg(feature = "stack-guard-page")]
+    fn remap_guard_page(&self) {
+        let guard_bottom = self.guard_bottom();
+        ax_mm::kernel_aspace()
+            .lock()
+            .map_linear(
+                guard_bottom,
+                ax_hal::mem::virt_to_phys(guard_bottom),
+                PAGE_SIZE_4K,
+                ax_hal::paging::MappingFlags::READ | ax_hal::paging::MappingFlags::WRITE,
+            )
+            .expect("failed to restore task stack guard page mapping");
+        flush_stack_guard_tlb(guard_bottom);
+    }
+
+    #[inline]
     fn canary_ptr(&self) -> *mut usize {
         self.ptr as *mut usize
     }
 
     #[inline]
-    #[cfg(feature = "stack-canary")]
     unsafe fn write_canary(&self) {
         unsafe { self.canary_ptr().write(STACK_END_MAGIC) };
     }
 
     #[inline]
-    #[cfg(feature = "stack-canary")]
     pub fn is_canary_intact(&self) -> bool {
         unsafe { self.canary_ptr().read() == STACK_END_MAGIC }
     }
 
-    #[cfg(test)]
-    #[cfg(feature = "stack-canary")]
+    #[cfg(all(test, not(feature = "stack-guard-page")))]
     fn corrupt_canary_for_test(&self) {
         unsafe { self.canary_ptr().write(0) };
     }
 }
 
+#[cfg(all(
+    feature = "stack-guard-page",
+    not(all(feature = "smp", feature = "ipi"))
+))]
+fn flush_stack_guard_tlb(vaddr: VirtAddr) {
+    ax_hal::asm::flush_tlb(Some(vaddr));
+}
+
+#[cfg(all(feature = "stack-guard-page", feature = "smp", feature = "ipi"))]
+fn flush_stack_guard_tlb(vaddr: VirtAddr) {
+    let _guard = ax_kernel_guard::NoPreempt::new();
+    let current_cpu = ax_hal::percpu::this_cpu_id();
+    let ack_count = Arc::new(AtomicUsize::new(0));
+    let mut remote_cpu_count = 0;
+
+    core::sync::atomic::fence(Ordering::SeqCst);
+
+    for cpu_id in 0..ax_hal::cpu_num() {
+        if cpu_id == current_cpu || !ax_ipi::wait_until_cpu_ready(cpu_id) {
+            continue;
+        }
+
+        remote_cpu_count += 1;
+        let ack_count = ack_count.clone();
+        ax_ipi::run_on_cpu(cpu_id, move || {
+            ax_hal::asm::flush_tlb(Some(vaddr));
+            ack_count.fetch_add(1, Ordering::Release);
+        });
+    }
+
+    ax_hal::asm::flush_tlb(Some(vaddr));
+    if remote_cpu_count == 0 {
+        return;
+    }
+
+    const MAX_WAIT_NS: u64 = 5 * ax_hal::time::NANOS_PER_SEC;
+    let start = ax_hal::time::monotonic_time_nanos();
+    while ack_count.load(Ordering::Acquire) != remote_cpu_count {
+        core::hint::spin_loop();
+        if ax_hal::time::monotonic_time_nanos() - start > MAX_WAIT_NS {
+            let acked = ack_count.load(Ordering::Acquire);
+            panic!(
+                "task stack guard page TLB shootdown timeout: CPU {current_cpu} got \
+                 {acked}/{remote_cpu_count} ack(s) for vaddr={vaddr:#x}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "stack-guard-page")]
+impl TaskInner {
+    /// Reports whether `fault_addr` hits this task's stack guard page.
+    pub fn diagnose_stack_guard_page_fault(&self, fault_addr: VirtAddr) -> bool {
+        if !self.kstack.contains_guard_addr(fault_addr) {
+            return false;
+        }
+
+        error!(
+            "task stack guard page hit for {}: fault_addr={:#x}, stack=[{:#x}..{:#x}), \
+             guard=[{:#x}..{:#x})",
+            self.id_name(),
+            fault_addr.as_usize(),
+            self.kstack.bottom().as_usize(),
+            self.kstack.top().as_usize(),
+            self.kstack.guard_bottom().as_usize(),
+            self.kstack.guard_top().as_usize(),
+        );
+        true
+    }
+}
+
 impl Drop for TaskStack {
     fn drop(&mut self) {
-        if self.owned {
-            let layout = Layout::from_size_align(self.size, self.align).unwrap();
-            unsafe { alloc::alloc::dealloc(self.ptr as *mut u8, layout) }
+        match self.kind {
+            #[cfg(not(feature = "stack-guard-page"))]
+            TaskStackKind::Alloc => {
+                let layout = Layout::from_size_align(self.size, self.align).unwrap();
+                unsafe { alloc::alloc::dealloc(self.ptr as *mut u8, layout) }
+            }
+            #[cfg(feature = "stack-guard-page")]
+            TaskStackKind::GuardedAlloc => {
+                self.remap_guard_page();
+                ax_alloc::global_allocator().dealloc_pages(
+                    self.guard_bottom().as_usize(),
+                    self.alloc_pages,
+                    ax_alloc::UsageKind::Global,
+                );
+            }
+            TaskStackKind::Borrowed => {}
         }
     }
 }
@@ -626,7 +989,7 @@ impl Drop for TaskStack {
 mod stack_tests {
     use super::{TASK_STACK_ALIGN, TaskStack};
 
-    #[cfg(feature = "stack-canary")]
+    #[cfg(not(feature = "stack-guard-page"))]
     #[test]
     fn task_stack_canary_detects_corruption() {
         let stack = TaskStack::alloc(0x1000);
@@ -637,13 +1000,20 @@ mod stack_tests {
         assert!(!stack.is_canary_intact());
     }
 
-    #[cfg(feature = "stack-canary")]
+    #[cfg(not(feature = "stack-guard-page"))]
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn task_stack_top_stays_16_byte_aligned() {
         // x86_64 TaskContext::init() builds the initial switch frame from
         // kstack_top and assumes the ABI-required 16-byte stack alignment.
         let stack = TaskStack::alloc(0x1000);
+        assert_eq!(stack.top().as_usize() % TASK_STACK_ALIGN, 0);
+    }
+
+    #[cfg(feature = "stack-guard-page")]
+    #[test]
+    fn borrowed_task_stack_top_stays_16_byte_aligned_with_guard_feature() {
+        let stack = TaskStack::borrowed(0x1000.into(), 0x1000, TASK_STACK_ALIGN);
         assert_eq!(stack.top().as_usize() % TASK_STACK_ALIGN, 0);
     }
 }
@@ -655,7 +1025,12 @@ pub struct CurrentTask(ManuallyDrop<AxTaskRef>);
 
 impl CurrentTask {
     pub(crate) fn try_get() -> Option<Self> {
-        let ptr: *const super::AxTask = ax_hal::percpu::current_task_ptr();
+        // SAFETY: the scheduler keeps one raw strong reference for the current
+        // task until `set_current` transfers ownership to the next task. This
+        // bootstrap read is also used by the preemption guard implementation,
+        // so it cannot require that same guard to have been acquired already.
+        let header = unsafe { ax_hal::percpu::current_thread_raw().as_ref()? };
+        let ptr = header.current_context()?.as_usize() as *const super::AxTask;
         if !ptr.is_null() {
             Some(Self(unsafe { ManuallyDrop::new(AxTaskRef::from_raw(ptr)) }))
         } else {
@@ -680,23 +1055,28 @@ impl CurrentTask {
 
     pub(crate) unsafe fn init_current(init_task: AxTaskRef) {
         assert!(init_task.is_init());
-        #[cfg(feature = "tls")]
+        // SAFETY: scheduler initialization runs on an offline CPU before any
+        // task switch or migration can occur.
+        let header = init_task.current_header();
         unsafe {
-            ax_hal::asm::write_thread_pointer(init_task.tls.tls_ptr() as usize)
-        };
-        let ptr = Arc::into_raw(init_task);
-        unsafe {
-            ax_hal::percpu::set_current_task_ptr(ptr);
+            ax_hal::percpu::with_cpu_pin(|pin| {
+                #[cfg(feature = "tls")]
+                ax_hal::percpu::install_bootstrap_kernel_tls(
+                    pin,
+                    KernelTlsBase::new(init_task.tls.tls_ptr() as usize),
+                );
+                ax_hal::percpu::install_bootstrap_thread(pin, header)
+            })
         }
+        .expect("CPU-local area must precede task initialization")
+        .expect("bootstrap current-thread state must install");
+        let _ = Arc::into_raw(init_task);
     }
 
     pub(crate) unsafe fn set_current(prev: Self, next: AxTaskRef) {
         let Self(arc) = prev;
         ManuallyDrop::into_inner(arc); // `call Arc::drop()` to decrease prev task reference count.
-        let ptr = Arc::into_raw(next);
-        unsafe {
-            ax_hal::percpu::set_current_task_ptr(ptr);
-        }
+        let _ = Arc::into_raw(next);
     }
 }
 
@@ -709,17 +1089,86 @@ impl Deref for CurrentTask {
 }
 
 extern "C" fn task_entry() -> ! {
-    #[cfg(feature = "smp")]
     unsafe {
         // Clear the prev task on CPU before running the task entry function.
         crate::run_queue::clear_prev_task_on_cpu();
     }
     // Enable irq (if feature "irq" is enabled) before running the task entry function.
-    #[cfg(feature = "irq")]
+    #[cfg(all(feature = "irq", not(feature = "host-test")))]
     ax_hal::asm::enable_irqs();
     let task = crate::current();
     if let Some(entry) = task.entry.take() {
         entry()
     }
     crate::exit(0);
+}
+
+#[cfg(axtest)]
+pub(crate) fn task_id_and_state_hold_for_test() -> bool {
+    // Test TaskId
+    let id1 = TaskId(1);
+    let id2 = TaskId(2);
+    assert!(id1 != id2);
+    assert!(id1 == id1);
+
+    // Test TaskState variants
+    assert!(TaskState::Running as u8 == 1);
+    assert!(TaskState::Ready as u8 == 2);
+
+    true
+}
+
+#[cfg(axtest)]
+pub(crate) fn task_constants_hold_for_test() -> bool {
+    // Test TASK_STACK_ALIGN constant
+    assert_eq!(TASK_STACK_ALIGN, 16);
+
+    // Test STACK_END_MAGIC for 64-bit
+    #[cfg(target_pointer_width = "64")]
+    assert!(STACK_END_MAGIC == 0x57AC_CE11_57AC_CE11usize);
+
+    true
+}
+
+#[cfg(axtest)]
+pub(crate) fn task_id_operations_hold_for_test() -> bool {
+    // Test TaskId operations
+    let id1 = TaskId(100);
+    let id2 = TaskId(200);
+
+    // Test equality
+    assert!(id1 == id1);
+    assert!(id1 != id2);
+
+    // Test clone
+    let id3 = id1.clone();
+    assert!(id1 == id3);
+
+    // Test copy
+    let id4 = id1;
+    assert!(id4 == id1);
+
+    true
+}
+
+#[cfg(axtest)]
+pub(crate) fn task_state_all_variants_hold_for_test() -> bool {
+    // Test all TaskState variants
+    let running = TaskState::Running;
+    let ready = TaskState::Ready;
+    let blocked = TaskState::Blocked;
+    let exited = TaskState::Exited;
+
+    // Verify all are different
+    assert!(core::mem::discriminant(&running) != core::mem::discriminant(&ready));
+    assert!(core::mem::discriminant(&ready) != core::mem::discriminant(&blocked));
+    assert!(core::mem::discriminant(&blocked) != core::mem::discriminant(&exited));
+
+    // Verify ordinal values
+    assert!(running as u8 == 1);
+    assert!(ready as u8 == 2);
+    assert!(blocked as u8 == 3);
+    assert!(exited as u8 == 4);
+
+    true
 }

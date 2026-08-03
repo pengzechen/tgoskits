@@ -18,11 +18,19 @@ RUN apt-get update \
         curl \
         dosfstools \
         e2fsprogs \
+        fakeroot \
         git \
+        libavcodec-dev \
+        libavdevice-dev \
+        libavfilter-dev \
+        libavformat-dev \
+        libavutil-dev \
         libglib2.0-dev \
         libclang-19-dev \
         libpixman-1-dev \
         libslirp-dev \
+        libswresample-dev \
+        libswscale-dev \
         libudev-dev \
         make \
         meson \
@@ -76,7 +84,7 @@ RUN set -eux; \
     cd /tmp/rust-toolchain; \
     rustc --version; \
     cargo --version; \
-    cargo install cargo-binutils axconfig-gen cargo-axplat
+    cargo install cargo-binutils
 
 WORKDIR /workspace
 

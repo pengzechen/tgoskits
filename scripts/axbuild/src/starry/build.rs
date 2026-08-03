@@ -1,20 +1,31 @@
-use std::path::{Path, PathBuf};
-
-use ostool::build::config::Cargo;
-
-pub type StarryBuildInfo = crate::arceos::build::ArceosBuildInfo;
-pub use crate::arceos::build::LogLevel;
-use crate::context::{
-    ResolvedStarryRequest, STARRY_PACKAGE, starry_arch_for_target_checked, workspace_manifest_path,
-    workspace_metadata_root_manifest,
+use std::{
+    env, fs,
+    io::Write as _,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    time::Instant,
 };
 
-impl StarryBuildInfo {
-    pub fn default_starry_for_target(target: &str) -> Self {
-        let mut build_info = Self::default_for_target(target);
-        build_info.plat_dyn = false;
-        build_info.features = vec!["qemu".to_string()];
-        build_info
+use anyhow::{Context as _, anyhow, bail};
+use cargo_metadata::Metadata;
+use object::{Object as _, ObjectSection as _};
+use ostool::build::config::Cargo;
+
+use super::{Starry, board};
+pub type StarryBuildInfo = crate::build::BuildInfo;
+pub use crate::build::LogLevel;
+use crate::{
+    build::BareKernelLinkMode,
+    context::{ResolvedStarryRequest, STARRY_PACKAGE, starry_arch_for_target_checked},
+    support::process::ProcessExt,
+};
+
+pub(crate) fn default_starry_build_info() -> StarryBuildInfo {
+    // The package and board configuration own feature selection; a generated
+    // default must remain an empty capability set.
+    StarryBuildInfo {
+        features: Vec::new(),
+        ..StarryBuildInfo::default()
     }
 }
 
@@ -28,28 +39,51 @@ pub(crate) fn resolve_build_info_path(
     }
 
     let _ = starry_arch_for_target_checked(target)?;
-    Ok(crate::arceos::build::default_build_info_path_in_workspace(
+    Ok(crate::build::default_build_info_path_in_workspace(
         workspace_root,
         STARRY_PACKAGE,
         target,
     ))
 }
 
+pub(crate) fn load_target_from_build_config(path: &Path) -> anyhow::Result<Option<String>> {
+    let content = crate::build::read_toml_with_rejector(
+        path,
+        "Starry build config",
+        reject_unsupported_starry_fields,
+    )?;
+
+    if let Ok(board_file) = toml::from_str::<board::StarryBoardFile>(&content) {
+        return Ok(Some(board_file.target));
+    }
+    if toml::from_str::<StarryBuildInfo>(&content).is_ok() {
+        return Ok(None);
+    }
+
+    Err(anyhow!("invalid Starry build config {}", path.display()))
+}
+
+fn reject_unsupported_starry_fields(path: &Path, content: &str) -> anyhow::Result<()> {
+    crate::build::reject_removed_std_field(path, content)?;
+    crate::build::reject_arceos_app_c_field(path, content)?;
+    Ok(())
+}
+
+#[cfg(test)]
 pub(crate) fn load_build_info(request: &ResolvedStarryRequest) -> anyhow::Result<StarryBuildInfo> {
-    let makefile_features = crate::arceos::build::makefile_features_from_env();
+    let makefile_features = crate::build::makefile_features_from_env();
     let mut build_info = if let Some(build_info) = &request.build_info_override {
         build_info.clone()
     } else {
-        crate::arceos::build::load_or_create_build_info(&request.build_info_path, || {
-            StarryBuildInfo::default_starry_for_target(&request.target)
-        })?
+        crate::build::ensure_build_info(&request.build_info_path, default_starry_build_info)?;
+        crate::build::load_toml_with_rejector(
+            &request.build_info_path,
+            "build info",
+            crate::build::reject_arceos_app_c_field,
+        )?
     };
 
-    crate::arceos::build::apply_makefile_features(
-        &mut build_info,
-        &request.package,
-        &makefile_features,
-    );
+    crate::build::apply_makefile_features(&mut build_info, &makefile_features)?;
 
     if let Some(smp) = request.smp {
         build_info.max_cpu_num = Some(smp);
@@ -59,83 +93,489 @@ pub(crate) fn load_build_info(request: &ResolvedStarryRequest) -> anyhow::Result
 }
 
 pub(crate) fn load_cargo_config(request: &ResolvedStarryRequest) -> anyhow::Result<Cargo> {
-    to_cargo_config(load_build_info(request)?, request)
-}
-
-pub(crate) fn to_cargo_config(
-    build_info: StarryBuildInfo,
-    request: &ResolvedStarryRequest,
-) -> anyhow::Result<Cargo> {
-    let mut cargo = build_info.into_prepared_base_cargo_config(
+    let metadata =
+        crate::build::cached_workspace_metadata().context("failed to load workspace metadata")?;
+    let makefile_features = crate::build::makefile_features_from_env();
+    let mut build_info = if let Some(build_info) = &request.build_info_override {
+        build_info.clone()
+    } else {
+        crate::build::ensure_build_info(&request.build_info_path, default_starry_build_info)?;
+        crate::build::load_toml_with_rejector(
+            &request.build_info_path,
+            "build info",
+            crate::build::reject_arceos_app_c_field,
+        )?
+    };
+    crate::build::apply_makefile_features(&mut build_info, &makefile_features)?;
+    enable_starry_smp_capability(&mut build_info.features);
+    build_info.features.sort();
+    build_info.features.dedup();
+    if let Some(smp) = request.smp {
+        build_info.max_cpu_num = Some(smp);
+    }
+    let mut cargo = build_info.into_prepared_no_std_cargo_config_with_metadata(
         &request.package,
         &request.target,
-        request.plat_dyn,
+        metadata,
+        BareKernelLinkMode::Pie,
     )?;
-    patch_starry_cargo_config(&mut cargo, request)?;
+    patch_starry_cargo_config(&mut cargo, request, metadata)?;
     Ok(cargo)
+}
+
+fn enable_starry_smp_capability(features: &mut Vec<String>) {
+    // Starry always compiles the SMP kernel paths. `SMP` limits the CPUs exposed
+    // at runtime; board configurations may intentionally leave that limit unset.
+    features.push("smp".to_string());
 }
 
 fn patch_starry_cargo_config(
     cargo: &mut Cargo,
     request: &ResolvedStarryRequest,
+    metadata: &Metadata,
 ) -> anyhow::Result<()> {
-    let platform = default_platform_for_arch(&request.arch)?;
-    let static_defplat = uses_static_default_platform(&cargo.features);
-
     cargo.package = request.package.clone();
-    cargo.target = request.target.clone();
-    ensure_starry_bin_arg(&mut cargo.args, &request.package)?;
-    if static_defplat {
-        cargo.features.push("qemu".to_string());
-        cargo.features.sort();
-        cargo.features.dedup();
-    }
-
+    ensure_starry_bin_arg(&mut cargo.args, &request.package, metadata)?;
+    apply_starry_bin_override(cargo)?;
     cargo
         .env
         .insert("AX_ARCH".to_string(), request.arch.clone());
     cargo
         .env
         .insert("AX_TARGET".to_string(), request.target.clone());
-    if static_defplat {
-        cargo
-            .env
-            .entry("AX_PLATFORM".to_string())
-            .or_insert_with(|| platform.to_string());
+
+    Ok(())
+}
+
+pub(crate) async fn build_starry_artifact(
+    starry: &mut Starry,
+    request: &ResolvedStarryRequest,
+    cargo: Cargo,
+) -> anyhow::Result<ostool::build::CargoBuildOutput> {
+    let stage = StageLog::start(format!(
+        "starry build package={} target={} arch={}",
+        cargo.package, request.target, request.arch
+    ));
+    let output = starry
+        .app
+        .build(cargo.clone(), request.build_info_path.clone())
+        .await?;
+    stage.done();
+    postprocess_starry_artifact(starry.app.workspace_root(), request, &cargo, &output)?;
+    Ok(output)
+}
+
+pub(crate) fn postprocess_starry_artifact(
+    workspace_root: &Path,
+    request: &ResolvedStarryRequest,
+    _cargo: &Cargo,
+    build_output: &ostool::build::CargoBuildOutput,
+) -> anyhow::Result<()> {
+    let elf = build_output.elf_path();
+    println!("[axbuild] starry artifact elf={}", elf.display());
+    generate_kallsyms(elf)?;
+    refresh_bin_if_present(elf)?;
+
+    if let Some(plan) = uimage_generation_plan(
+        &request.build_info_path,
+        &request.arch,
+        &request.target,
+        elf,
+    ) {
+        generate_uimage_from_its(workspace_root, &plan, &request.arch, &request.target, elf)?;
     }
 
     Ok(())
 }
 
-fn uses_static_default_platform(features: &[String]) -> bool {
-    let has_defplat = features.iter().any(|feature| {
-        matches!(
-            feature.as_str(),
-            "defplat" | "ax-feat/defplat" | "ax-std/defplat"
-        )
-    });
-    let has_dynamic = features.iter().any(|feature| {
-        matches!(
-            feature.as_str(),
-            "plat-dyn" | "ax-feat/plat-dyn" | "ax-std/plat-dyn"
-        )
-    });
-    let has_custom = features.iter().any(|feature| {
-        matches!(
-            feature.as_str(),
-            "myplat" | "ax-feat/myplat" | "ax-std/myplat"
-        )
-    });
+fn generate_kallsyms(kernel_elf: &Path) -> anyhow::Result<()> {
+    let stage = StageLog::start(format!("starry kallsyms elf={}", kernel_elf.display()));
+    ensure_kallsyms_tools()?;
+    let symbols = rust_nm_symbols(kernel_elf)?;
+    println!("[axbuild] starry kallsyms symbols={}", symbols.len());
+    let mut child = Command::new("gen_ksym")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("failed to spawn gen_ksym")?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("failed to open gen_ksym stdin")?;
+        for symbol in symbols {
+            writeln!(stdin, "{symbol}").context("failed to write symbols to gen_ksym")?;
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for gen_ksym")?;
+    if !output.status.success() {
+        bail!("gen_ksym exited with status {}", output.status);
+    }
 
-    has_defplat && !has_dynamic && !has_custom
+    let section_size = kallsyms_section_size(kernel_elf)?;
+    let mut kallsyms = output.stdout;
+    if kallsyms.len() > section_size {
+        bail!(
+            "generated kallsyms ({} bytes) exceed .kallsyms section ({section_size} bytes); \
+             remove the stale kernel ELF or rebuild it so the linker script reserve is restored",
+            kallsyms.len()
+        );
+    }
+    kallsyms.resize(section_size, 0);
+
+    let temp = temp_file_path(kernel_elf, "kallsyms")?;
+    fs::write(&temp, &kallsyms).with_context(|| format!("failed to write {}", temp.display()))?;
+    let result = update_kallsyms_section(kernel_elf, &temp);
+    let cleanup =
+        fs::remove_file(&temp).with_context(|| format!("failed to remove {}", temp.display()));
+    result?;
+    cleanup?;
+    stage.done();
+    Ok(())
 }
 
-fn ensure_starry_bin_arg(args: &mut Vec<String>, package: &str) -> anyhow::Result<()> {
+fn rust_nm_symbols(kernel_elf: &Path) -> anyhow::Result<Vec<String>> {
+    let output = Command::new("rust-nm")
+        .arg("-n")
+        .arg(kernel_elf)
+        .output()
+        .with_context(|| format!("failed to run rust-nm on {}", kernel_elf.display()))?;
+    if !output.status.success() {
+        bail!("rust-nm exited with status {}", output.status);
+    }
+
+    let mut symbols = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let Some(address) = fields.next() else {
+            continue;
+        };
+        let Some(kind) = fields.next() else {
+            continue;
+        };
+        let Some(name) = fields.next() else {
+            continue;
+        };
+        if matches!(kind, "T" | "t" | "D" | "B" | "R") && !name.starts_with(".L") && name != "$x" {
+            symbols.push(format!("{address} {kind} {name}"));
+        }
+    }
+    Ok(symbols)
+}
+
+fn kallsyms_section_size(kernel_elf: &Path) -> anyhow::Result<usize> {
+    let data =
+        fs::read(kernel_elf).with_context(|| format!("failed to read {}", kernel_elf.display()))?;
+    let file = object::File::parse(&*data)
+        .with_context(|| format!("failed to parse {}", kernel_elf.display()))?;
+    let section = file.section_by_name(".kallsyms").ok_or_else(|| {
+        anyhow!(
+            "failed to find .kallsyms section in {}",
+            kernel_elf.display()
+        )
+    })?;
+    usize::try_from(section.size()).with_context(|| {
+        format!(
+            ".kallsyms section in {} is too large for this host",
+            kernel_elf.display()
+        )
+    })
+}
+
+fn update_kallsyms_section(kernel_elf: &Path, kallsyms: &Path) -> anyhow::Result<()> {
+    Command::new("rust-objcopy")
+        .arg("--update-section")
+        .arg(format!(".kallsyms={}", kallsyms.display()))
+        .arg(kernel_elf)
+        .exec()
+        .with_context(|| format!("failed to update .kallsyms in {}", kernel_elf.display()))
+}
+
+fn refresh_bin_if_present(kernel_elf: &Path) -> anyhow::Result<()> {
+    let bin = kernel_elf.with_extension("bin");
+    if !bin.exists() {
+        println!(
+            "[axbuild] starry bin refresh skipped: {} does not exist",
+            bin.display()
+        );
+        return Ok(());
+    }
+    let stage = StageLog::start(format!("starry bin refresh {}", bin.display()));
+    Command::new("rust-objcopy")
+        .arg("--strip-all")
+        .arg("-O")
+        .arg("binary")
+        .arg(kernel_elf)
+        .arg(&bin)
+        .exec()
+        .with_context(|| format!("failed to refresh {}", bin.display()))?;
+    stage.done();
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UimageGenerationPlan {
+    source_its: PathBuf,
+    rendered_its: PathBuf,
+    kernel_bin: PathBuf,
+    output_uimg: PathBuf,
+}
+
+pub(crate) fn uimage_its_path_for_config(config_path: &Path) -> PathBuf {
+    config_path.with_extension("its")
+}
+
+fn uimage_generation_plan(
+    config_path: &Path,
+    _arch: &str,
+    _target: &str,
+    kernel_elf: &Path,
+) -> Option<UimageGenerationPlan> {
+    let source_its = uimage_its_path_for_config(config_path);
+    source_its.exists().then(|| {
+        let rendered_its = temp_file_path(kernel_elf, "uimage.its")
+            .expect("kernel ELF path should have a valid parent and filename");
+        let kernel_bin = kernel_elf.with_extension("bin");
+        let output_uimg = kernel_bin.with_extension("uimg");
+        UimageGenerationPlan {
+            source_its,
+            rendered_its,
+            kernel_bin,
+            output_uimg,
+        }
+    })
+}
+
+fn generate_uimage_from_its(
+    workspace_root: &Path,
+    plan: &UimageGenerationPlan,
+    arch: &str,
+    target: &str,
+    kernel_elf: &Path,
+) -> anyhow::Result<()> {
+    refresh_bin(kernel_elf, &plan.kernel_bin)?;
+    render_uimage_its_template(
+        &plan.source_its,
+        &plan.rendered_its,
+        kernel_elf,
+        &plan.kernel_bin,
+        arch,
+        target,
+    )?;
+    let stage = StageLog::start(format!(
+        "starry uImage arch={} its={} out={}",
+        arch,
+        plan.source_its.display(),
+        plan.output_uimg.display()
+    ));
+    let result = Command::new("mkimage")
+        .current_dir(workspace_root)
+        .args(mkimage_args_for_its(&plan.rendered_its, &plan.output_uimg))
+        .exec()
+        .with_context(|| format!("failed to generate {}", plan.output_uimg.display()));
+    let cleanup = fs::remove_file(&plan.rendered_its)
+        .with_context(|| format!("failed to remove {}", plan.rendered_its.display()));
+    result?;
+    cleanup?;
+    stage.done();
+    Ok(())
+}
+
+fn refresh_bin(kernel_elf: &Path, bin: &Path) -> anyhow::Result<()> {
+    let stage = StageLog::start(format!("starry bin refresh {}", bin.display()));
+    Command::new("rust-objcopy")
+        .arg("--strip-all")
+        .arg("-O")
+        .arg("binary")
+        .arg(kernel_elf)
+        .arg(bin)
+        .exec()
+        .with_context(|| format!("failed to refresh {}", bin.display()))?;
+    stage.done();
+    Ok(())
+}
+
+fn render_uimage_its_template(
+    template: &Path,
+    rendered: &Path,
+    kernel_elf: &Path,
+    kernel_bin: &Path,
+    arch: &str,
+    target: &str,
+) -> anyhow::Result<()> {
+    let content = fs::read_to_string(template)
+        .with_context(|| format!("failed to read {}", template.display()))?;
+    let rendered_content = content
+        .replace("${kernel_bin}", &kernel_bin.display().to_string())
+        .replace("${kernel_elf}", &kernel_elf.display().to_string())
+        .replace("${arch}", arch)
+        .replace("${target}", target);
+    fs::write(rendered, rendered_content)
+        .with_context(|| format!("failed to write {}", rendered.display()))
+}
+
+fn mkimage_args_for_its(rendered_its: &Path, output_uimg: &Path) -> Vec<String> {
+    vec![
+        "-f".to_string(),
+        rendered_its.display().to_string(),
+        output_uimg.display().to_string(),
+    ]
+}
+
+fn ensure_kallsyms_tools() -> anyhow::Result<()> {
+    ensure_llvm_tools()?;
+    if !command_available("rust-nm") || !command_available("rust-objcopy") {
+        install_rust_binutils()?;
+    }
+    if !command_available("gen_ksym") {
+        install_ksym()?;
+    }
+    require_command("rust-nm")?;
+    require_command("rust-objcopy")?;
+    require_command("gen_ksym")
+}
+
+fn ensure_llvm_tools() -> anyhow::Result<()> {
+    if command_available("rust-nm") && command_available("rust-objcopy") {
+        return Ok(());
+    }
+    if !command_available("rustup") {
+        return Ok(());
+    }
+    let output = Command::new("rustup")
+        .args(["component", "list", "--installed"])
+        .output()
+        .context("failed to list installed rustup components")?;
+    if String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.starts_with("llvm-tools"))
+    {
+        return Ok(());
+    }
+    if !kallsyms_auto_install_enabled() {
+        bail!(
+            "llvm-tools-preview is required; install it with: rustup component add \
+             llvm-tools-preview"
+        );
+    }
+    Command::new("rustup")
+        .args(["component", "add", "llvm-tools-preview"])
+        .exec()
+        .context("failed to install llvm-tools-preview")
+}
+
+fn install_rust_binutils() -> anyhow::Result<()> {
+    if !kallsyms_auto_install_enabled() {
+        bail!(
+            "rust-nm and rust-objcopy are required; install them with: rustup component add \
+             llvm-tools-preview && cargo install cargo-binutils"
+        );
+    }
+    if command_available("rustup") {
+        Command::new("rustup")
+            .args(["component", "add", "llvm-tools-preview"])
+            .exec()
+            .context("failed to install llvm-tools-preview")?;
+    }
+    Command::new("cargo")
+        .args(["install", "cargo-binutils"])
+        .exec()
+        .context("failed to install cargo-binutils")
+}
+
+fn install_ksym() -> anyhow::Result<()> {
+    if !kallsyms_auto_install_enabled() {
+        bail!("gen_ksym is required; install it with: cargo install ksym");
+    }
+    Command::new("cargo")
+        .args(["install", "ksym"])
+        .exec()
+        .context("failed to install ksym")
+}
+
+fn kallsyms_auto_install_enabled() -> bool {
+    !matches!(
+        env::var("AXBUILD_STARRY_KALLSYMS_AUTO_INSTALL")
+            .unwrap_or_else(|_| "1".to_string())
+            .as_str(),
+        "0" | "n" | "no" | "false" | "off"
+    )
+}
+
+fn command_available(name: &str) -> bool {
+    let path = Path::new(name);
+    if path.components().count() > 1 {
+        return path.is_file();
+    }
+
+    env::var_os("PATH").is_some_and(|paths| {
+        env::split_paths(&paths).any(|dir| {
+            let candidate = dir.join(name);
+            candidate.is_file()
+                || cfg!(windows)
+                    && env::var_os("PATHEXT").is_some_and(|exts| {
+                        exts.to_string_lossy()
+                            .split(';')
+                            .any(|ext| dir.join(format!("{name}{ext}")).is_file())
+                    })
+        })
+    })
+}
+
+fn require_command(name: &str) -> anyhow::Result<()> {
+    if command_available(name) {
+        Ok(())
+    } else {
+        bail!("required command `{name}` is not available")
+    }
+}
+
+fn temp_file_path(path: &Path, suffix: &str) -> anyhow::Result<PathBuf> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("invalid path without parent: {}", path.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("invalid path filename: {}", path.display()))?;
+    Ok(parent.join(format!(".{name}.{suffix}.{}.tmp", std::process::id())))
+}
+
+fn apply_starry_bin_override(cargo: &mut Cargo) -> anyhow::Result<()> {
+    let Some(bin) = cargo.env.get("AXBUILD_STARRY_BIN").cloned() else {
+        return Ok(());
+    };
+    if bin.trim().is_empty() {
+        bail!("AXBUILD_STARRY_BIN must not be empty");
+    }
+
+    let mut args = Vec::with_capacity(cargo.args.len() + 2);
+    let mut iter = cargo.args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--bin" {
+            let _ = iter.next();
+            continue;
+        }
+        args.push(arg.clone());
+    }
+    args.push("--bin".to_string());
+    args.push(bin);
+    cargo.args = args;
+    Ok(())
+}
+
+fn ensure_starry_bin_arg(
+    args: &mut Vec<String>,
+    package: &str,
+    metadata: &Metadata,
+) -> anyhow::Result<()> {
     if args.iter().any(|arg| arg == "--bin") {
         return Ok(());
     }
 
-    if package_has_bin_named(package, package)? {
+    if package_has_bin_named(package, package, metadata)? {
         args.push("--bin".to_string());
         args.push(package.to_string());
     }
@@ -143,9 +583,11 @@ fn ensure_starry_bin_arg(args: &mut Vec<String>, package: &str) -> anyhow::Resul
     Ok(())
 }
 
-fn package_has_bin_named(package: &str, bin_name: &str) -> anyhow::Result<bool> {
-    let workspace_manifest = workspace_manifest_path()?;
-    let metadata = workspace_metadata_root_manifest(&workspace_manifest)?;
+fn package_has_bin_named(
+    package: &str,
+    bin_name: &str,
+    metadata: &Metadata,
+) -> anyhow::Result<bool> {
     let package_info = metadata
         .packages
         .iter()
@@ -161,368 +603,29 @@ fn package_has_bin_named(package: &str, bin_name: &str) -> anyhow::Result<bool> 
     }))
 }
 
-fn default_platform_for_arch(arch: &str) -> anyhow::Result<&'static str> {
-    match arch {
-        "aarch64" => Ok("aarch64-qemu-virt"),
-        "x86_64" => Ok("x86-pc"),
-        "riscv64" => Ok("riscv64-qemu-virt"),
-        "loongarch64" => Ok("loongarch64-qemu-virt"),
-        _ => anyhow::bail!(
-            "unsupported Starry architecture `{arch}`; expected one of aarch64, x86_64, riscv64, \
-             loongarch64"
-        ),
+struct StageLog {
+    name: String,
+    started: Instant,
+}
+
+impl StageLog {
+    fn start(name: impl Into<String>) -> Self {
+        let name = name.into();
+        println!("[axbuild] {name} ...");
+        Self {
+            name,
+            started: Instant::now(),
+        }
+    }
+
+    fn done(self) {
+        println!(
+            "[axbuild] {} ... done ({:.2?})",
+            self.name,
+            self.started.elapsed()
+        );
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{collections::HashMap, fs};
-
-    use tempfile::tempdir;
-
-    use super::*;
-    use crate::context::STARRY_PACKAGE;
-
-    fn write_minimal_package_manifest(path: &Path, name: &str) {
-        let src_dir = path.parent().unwrap().join("src");
-        fs::create_dir_all(&src_dir).unwrap();
-        fs::write(src_dir.join("lib.rs"), "").unwrap();
-        fs::write(
-            path,
-            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
-        )
-        .unwrap();
-    }
-
-    fn request(path: PathBuf, arch: &str, target: &str) -> ResolvedStarryRequest {
-        ResolvedStarryRequest {
-            package: STARRY_PACKAGE.to_string(),
-            arch: arch.to_string(),
-            target: target.to_string(),
-            plat_dyn: None,
-            smp: None,
-            debug: false,
-            build_info_path: path,
-            build_info_override: None,
-            qemu_config: None,
-            uboot_config: None,
-        }
-    }
-
-    #[test]
-    fn resolve_build_info_path_uses_default_starry_location() {
-        let root = tempdir().unwrap();
-        let starry_dir = root.path().join("os/StarryOS/starryos");
-        fs::create_dir_all(&starry_dir).unwrap();
-        write_minimal_package_manifest(&starry_dir.join("Cargo.toml"), STARRY_PACKAGE);
-        fs::write(
-            root.path().join("Cargo.toml"),
-            "[workspace]\nmembers = [\"os/StarryOS/starryos\"]\n",
-        )
-        .unwrap();
-        let path =
-            resolve_build_info_path(root.path(), "aarch64-unknown-none-softfloat", None).unwrap();
-
-        assert_eq!(
-            path,
-            root.path()
-                .join("target/axbuild/config/starryos/build-aarch64-unknown-none-softfloat.toml")
-        );
-    }
-
-    #[test]
-    fn resolve_build_info_path_ignores_source_tree_defaults() {
-        let root = tempdir().unwrap();
-        let starry_dir = root.path().join("os/StarryOS/starryos");
-        fs::create_dir_all(&starry_dir).unwrap();
-        write_minimal_package_manifest(&starry_dir.join("Cargo.toml"), STARRY_PACKAGE);
-        fs::write(
-            root.path().join("Cargo.toml"),
-            "[workspace]\nmembers = [\"os/StarryOS/starryos\"]\n",
-        )
-        .unwrap();
-        let bare = starry_dir.join("build-aarch64-unknown-none-softfloat.toml");
-        let dotted = starry_dir.join(".build-aarch64-unknown-none-softfloat.toml");
-        fs::write(&bare, "").unwrap();
-        fs::write(&dotted, "").unwrap();
-
-        let path =
-            resolve_build_info_path(root.path(), "aarch64-unknown-none-softfloat", None).unwrap();
-
-        assert_eq!(
-            path,
-            root.path()
-                .join("target/axbuild/config/starryos/build-aarch64-unknown-none-softfloat.toml")
-        );
-    }
-
-    #[test]
-    fn resolve_build_info_path_prefers_explicit_path() {
-        let root = tempdir().unwrap();
-        let starry_dir = root.path().join("os/StarryOS/starryos");
-        fs::create_dir_all(&starry_dir).unwrap();
-        write_minimal_package_manifest(&starry_dir.join("Cargo.toml"), STARRY_PACKAGE);
-        fs::write(
-            root.path().join("Cargo.toml"),
-            "[workspace]\nmembers = [\"os/StarryOS/starryos\"]\n",
-        )
-        .unwrap();
-        let explicit = root.path().join("custom/build.toml");
-        let path =
-            resolve_build_info_path(root.path(), "x86_64-unknown-none", Some(explicit.clone()))
-                .unwrap();
-
-        assert_eq!(path, explicit);
-    }
-
-    #[test]
-    fn load_build_info_writes_default_template_when_missing() {
-        let root = tempdir().unwrap();
-        let path = root.path().join(".build-target.toml");
-        let request = request(path.clone(), "aarch64", "aarch64-unknown-none-softfloat");
-
-        let build_info = load_build_info(&request).unwrap();
-
-        assert_eq!(
-            build_info,
-            StarryBuildInfo::default_starry_for_target("aarch64-unknown-none-softfloat")
-        );
-        assert!(path.exists());
-        let persisted: StarryBuildInfo =
-            toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-        assert_eq!(persisted, build_info);
-    }
-
-    #[test]
-    fn load_build_info_reads_existing_file() {
-        let root = tempdir().unwrap();
-        let path = root.path().join(".build-target.toml");
-        fs::write(
-            &path,
-            r#"
-log = "Info"
-features = ["net"]
-
-[env]
-HELLO = "world"
-"#,
-        )
-        .unwrap();
-
-        let request = request(path, "aarch64", "aarch64-unknown-none-softfloat");
-        let build_info = load_build_info(&request).unwrap();
-
-        assert_eq!(build_info.log, LogLevel::Info);
-        assert_eq!(build_info.features, vec!["net".to_string()]);
-        assert_eq!(
-            build_info.env.get("HELLO").map(String::as_str),
-            Some("world")
-        );
-    }
-
-    #[test]
-    fn load_build_info_prefers_request_override_without_writing_file() {
-        let root = tempdir().unwrap();
-        let path = root.path().join(".build-target.toml");
-        let mut request = request(path.clone(), "aarch64", "aarch64-unknown-none-softfloat");
-        request.build_info_override = Some(StarryBuildInfo {
-            log: LogLevel::Info,
-            features: vec!["net".to_string()],
-            ..StarryBuildInfo::default_starry_for_target("aarch64-unknown-none-softfloat")
-        });
-
-        let build_info = load_build_info(&request).unwrap();
-
-        assert_eq!(build_info.log, LogLevel::Info);
-        assert_eq!(build_info.features, vec!["net".to_string()]);
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn patch_starry_cargo_config_injects_required_features_and_env() {
-        let request = request(
-            PathBuf::from("/tmp/.build.toml"),
-            "aarch64",
-            "aarch64-unknown-none-softfloat",
-        );
-        let build_info = StarryBuildInfo {
-            env: HashMap::from([(String::from("CUSTOM"), String::from("1"))]),
-            features: vec!["net".to_string()],
-            log: LogLevel::Info,
-            max_cpu_num: None,
-            axconfig_overrides: Vec::new(),
-            plat_dyn: false,
-        };
-        let mut cargo = build_info.into_base_cargo_config_with_log(
-            STARRY_PACKAGE.to_string(),
-            request.target.clone(),
-            vec![],
-        );
-        patch_starry_cargo_config(&mut cargo, &request).unwrap();
-
-        assert_eq!(cargo.package, STARRY_PACKAGE);
-        assert_eq!(cargo.target, "aarch64-unknown-none-softfloat");
-        assert_eq!(cargo.features, vec!["net".to_string()]);
-        assert_eq!(
-            cargo.env.get("AX_ARCH").map(String::as_str),
-            Some("aarch64")
-        );
-        assert_eq!(
-            cargo.env.get("AX_TARGET").map(String::as_str),
-            Some("aarch64-unknown-none-softfloat")
-        );
-        assert_eq!(cargo.env.get("AX_PLATFORM").map(String::as_str), None);
-        assert_eq!(cargo.env.get("AX_LOG").map(String::as_str), Some("info"));
-        assert_eq!(cargo.env.get("CUSTOM").map(String::as_str), Some("1"));
-        assert!(cargo.to_bin);
-    }
-
-    #[test]
-    fn patch_starry_cargo_config_preserves_request_package() {
-        let request = ResolvedStarryRequest {
-            package: STARRY_PACKAGE.to_string(),
-            arch: "x86_64".to_string(),
-            target: "x86_64-unknown-none".to_string(),
-            plat_dyn: None,
-            smp: None,
-            debug: false,
-            build_info_path: PathBuf::from("/tmp/.build.toml"),
-            build_info_override: None,
-            qemu_config: None,
-            uboot_config: None,
-        };
-        let build_info = StarryBuildInfo::default_starry_for_target("x86_64-unknown-none");
-        let mut cargo = build_info.into_base_cargo_config_with_log(
-            "placeholder".to_string(),
-            request.target.clone(),
-            vec![],
-        );
-
-        patch_starry_cargo_config(&mut cargo, &request).unwrap();
-
-        assert_eq!(cargo.package, STARRY_PACKAGE);
-        assert_eq!(
-            cargo.args,
-            vec!["--bin".to_string(), STARRY_PACKAGE.to_string()]
-        );
-    }
-
-    #[test]
-    fn patch_starry_cargo_config_skips_qemu_for_dynamic_platforms() {
-        let request = request(
-            PathBuf::from("/tmp/.build.toml"),
-            "aarch64",
-            "aarch64-unknown-none-softfloat",
-        );
-        let build_info = StarryBuildInfo {
-            env: HashMap::new(),
-            features: vec![
-                "common".to_string(),
-                "ax-feat/bus-mmio".to_string(),
-                "ax-feat/driver-sdmmc".to_string(),
-                "ax-feat/plat-dyn".to_string(),
-                "axplat-dyn/rockchip-soc".to_string(),
-                "axplat-dyn/sdmmc".to_string(),
-            ],
-            log: LogLevel::Info,
-            max_cpu_num: Some(8),
-            axconfig_overrides: Vec::new(),
-            plat_dyn: true,
-        };
-        let mut cargo = build_info.into_base_cargo_config_with_log(
-            STARRY_PACKAGE.to_string(),
-            request.target.clone(),
-            StarryBuildInfo::build_cargo_args(&request.target, true),
-        );
-
-        patch_starry_cargo_config(&mut cargo, &request).unwrap();
-
-        assert!(
-            cargo
-                .features
-                .contains(&"axplat-dyn/rockchip-soc".to_string())
-        );
-        assert!(cargo.features.contains(&"axplat-dyn/sdmmc".to_string()));
-        assert!(!cargo.features.contains(&"qemu".to_string()));
-        assert!(!cargo.env.contains_key("AX_PLATFORM"));
-        assert!(
-            cargo
-                .args
-                .iter()
-                .any(|arg| arg.contains("-Clink-arg=-Taxplat.x"))
-        );
-    }
-
-    #[test]
-    fn resolve_build_info_path_supports_starry_subworkspace_root() {
-        let root = tempdir().unwrap();
-        let starry_dir = root.path().join("starryos");
-        fs::create_dir_all(&starry_dir).unwrap();
-        write_minimal_package_manifest(&starry_dir.join("Cargo.toml"), STARRY_PACKAGE);
-        fs::write(
-            root.path().join("Cargo.toml"),
-            "[workspace]\nmembers = [\"starryos\"]\n",
-        )
-        .unwrap();
-
-        let path =
-            resolve_build_info_path(root.path(), "aarch64-unknown-none-softfloat", None).unwrap();
-
-        assert_eq!(
-            path,
-            root.path()
-                .join("target/axbuild/config/starryos/build-aarch64-unknown-none-softfloat.toml")
-        );
-    }
-
-    #[test]
-    fn patch_starry_cargo_config_keeps_linker_x_arg() {
-        let request = ResolvedStarryRequest {
-            package: STARRY_PACKAGE.to_string(),
-            arch: "aarch64".to_string(),
-            target: "aarch64-unknown-none-softfloat".to_string(),
-            plat_dyn: None,
-            smp: None,
-            debug: false,
-            build_info_path: PathBuf::from(
-                "/tmp/os/StarryOS/starryos/.build-aarch64-unknown-none-softfloat.toml",
-            ),
-            build_info_override: None,
-            qemu_config: None,
-            uboot_config: None,
-        };
-        let build_info = StarryBuildInfo::default_starry_for_target(&request.target);
-        let mut cargo = build_info.into_base_cargo_config_with_log(
-            request.package.clone(),
-            request.target.clone(),
-            StarryBuildInfo::build_cargo_args(&request.target, false),
-        );
-
-        patch_starry_cargo_config(&mut cargo, &request).unwrap();
-
-        assert!(
-            cargo
-                .args
-                .iter()
-                .any(|arg| arg.contains("-Clink-arg=-Tlinker.x"))
-        );
-    }
-
-    #[test]
-    fn ensure_starry_bin_arg_adds_bin_for_starryos_package() {
-        let mut args = Vec::new();
-
-        ensure_starry_bin_arg(&mut args, "starryos").unwrap();
-
-        assert_eq!(args, vec!["--bin".to_string(), "starryos".to_string()]);
-    }
-
-    #[test]
-    fn ensure_starry_bin_arg_keeps_existing_bin_arg() {
-        let mut args = vec!["--bin".to_string(), "starryos".to_string()];
-
-        ensure_starry_bin_arg(&mut args, STARRY_PACKAGE).unwrap();
-
-        assert_eq!(args, vec!["--bin".to_string(), "starryos".to_string()]);
-    }
-}
+mod tests;

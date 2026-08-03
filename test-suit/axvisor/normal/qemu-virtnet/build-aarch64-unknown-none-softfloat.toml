@@ -1,0 +1,23 @@
+features = []
+log = "Info"
+target = "aarch64-unknown-none-softfloat"
+vm_configs = ["os/axvisor/configs/vms/qemu/aarch64/arceos-virtnet-smp1.toml"]
+prebuild_commands = [
+  [
+    "cargo",
+    "xtask",
+    "arceos",
+    "build",
+    "-p",
+    "arceos-virtnet-echo",
+    "-c",
+    "apps/arceos/build-aarch64-virtnet.toml",
+  ],
+  [
+    "rust-objcopy",
+    "-O",
+    "binary",
+    "target/aarch64-unknown-linux-musl/release/arceos-virtnet-echo",
+    "target/aarch64-unknown-linux-musl/release/arceos-virtnet-echo.bin",
+  ],
+]

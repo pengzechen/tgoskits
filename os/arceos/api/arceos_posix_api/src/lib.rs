@@ -4,6 +4,8 @@
 
 #![cfg_attr(all(not(test), not(doc)), no_std)]
 #![allow(clippy::missing_safety_doc)]
+#![allow(clippy::needless_update)]
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 #[macro_use]
 extern crate ax_log;
@@ -13,41 +15,47 @@ extern crate ax_runtime;
 extern crate alloc;
 
 #[macro_use]
-mod utils;
+pub mod utils;
 
 mod imp;
 
 /// Platform-specific constants and parameters.
 pub mod config {
-    pub use ax_config::*;
+    /// Stack size used when callers do not provide an explicit task stack.
+    pub const TASK_STACK_SIZE: usize = 0x40000;
 }
 
 /// POSIX C types.
 #[rustfmt::skip]
-#[allow(dead_code, non_snake_case, non_camel_case_types, non_upper_case_globals, clippy::upper_case_acronyms, missing_docs)]
-pub mod ctypes {
+#[allow(nonstandard_style, dead_code, missing_docs)]
+pub mod ctypes_gen {
     include!(concat!(env!("OUT_DIR"), "/ctypes_gen.rs"));
 }
 
 #[cfg(feature = "fd")]
 pub use imp::fd_ops::{sys_close, sys_dup, sys_dup2, sys_fcntl};
 #[cfg(feature = "fs")]
-pub use imp::fs::{sys_fstat, sys_getcwd, sys_lseek, sys_lstat, sys_open, sys_rename, sys_stat};
+pub use imp::fs::{
+    sys_fstat, sys_getcwd, sys_getdents64, sys_lseek, sys_lstat, sys_open, sys_rename, sys_stat,
+};
+#[cfg(feature = "poll")]
+pub use imp::io_mpx::sys_poll;
 #[cfg(feature = "select")]
 pub use imp::io_mpx::sys_select;
 #[cfg(feature = "epoll")]
-pub use imp::io_mpx::{sys_epoll_create, sys_epoll_ctl, sys_epoll_wait};
+pub use imp::io_mpx::{sys_epoll_create, sys_epoll_create1, sys_epoll_ctl, sys_epoll_wait};
 #[cfg(feature = "net")]
 pub use imp::net::{
     sys_accept, sys_bind, sys_connect, sys_freeaddrinfo, sys_getaddrinfo, sys_getpeername,
-    sys_getsockname, sys_listen, sys_recv, sys_recvfrom, sys_send, sys_sendto, sys_shutdown,
-    sys_socket,
+    sys_getsockname, sys_listen, sys_recv, sys_recvfrom, sys_send, sys_sendto, sys_setsockopt,
+    sys_shutdown, sys_socket,
 };
 #[cfg(feature = "pipe")]
 pub use imp::pipe::sys_pipe;
 #[cfg(feature = "multitask")]
 pub use imp::pthread::mutex::{
-    sys_pthread_mutex_init, sys_pthread_mutex_lock, sys_pthread_mutex_unlock,
+    sys_pthread_mutex_destroy, sys_pthread_mutex_init, sys_pthread_mutex_lock,
+    sys_pthread_mutex_trylock, sys_pthread_mutex_unlock,
 };
 #[cfg(feature = "multitask")]
 pub use imp::pthread::{sys_pthread_create, sys_pthread_exit, sys_pthread_join, sys_pthread_self};
@@ -58,3 +66,5 @@ pub use imp::{
     task::{sys_exit, sys_getpid, sys_sched_yield},
     time::{sys_clock_gettime, sys_nanosleep},
 };
+
+pub use self::ctypes_gen as ctypes;

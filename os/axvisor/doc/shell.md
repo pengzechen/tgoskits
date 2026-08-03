@@ -683,8 +683,8 @@ AxVisor Shell模块**默认启用**，但不同功能对features有不同要求�
 ```bash
 # VM会在启动时自动创建并运行
 ./axvisor.sh run \
-  --plat aarch64-generic \
-  --vmconfigs configs/vms/nimbos-aarch64-qemu-smp1.toml
+  --arch aarch64 \
+  --vmconfigs configs/vms/qemu/aarch64/nimbos-smp1.toml
 ```
 
 **启动后**：
@@ -703,7 +703,7 @@ ID    NAME           STATE         VCPU   MEMORY
 #### 场景2：不自动启动VM（空Shell）
 ```bash
 # 不指定 vmconfigs 参数
-./axvisor.sh run --plat aarch64-generic --features fs,ept-level-4
+./axvisor.sh run --arch aarch64 --features fs
 ```
 
 **启动后**（需要手动创建VM）：
@@ -725,15 +725,15 @@ axvisor:/$ vm start 0
 
 #### 命令行指定
 ```bash
-./axvisor.sh run --vmconfigs configs/vms/vm1.toml,configs/vms/vm2.toml
+./axvisor.sh run --vmconfigs configs/vms/qemu/aarch64/vm1.toml,configs/vms/qemu/aarch64/vm2.toml
 ```
 
 #### 配置文件指定
 在 `.hvconfig.toml` 中：
 ```toml
 vmconfigs = [
-    "configs/vms/nimbos-aarch64-qemu-smp1.toml",
-    "configs/vms/linux-aarch64-qemu.toml"
+    "configs/vms/qemu/aarch64/nimbos-smp1.toml",
+    "configs/vms/qemu/aarch64/linux-smp1.toml"
 ]
 ```
 
@@ -755,8 +755,8 @@ vmconfigs = [
 ```bash
 # VM会自动启动
 ./axvisor.sh run \
-  --plat aarch64-generic \
-  --vmconfigs configs/vms/nimbos-aarch64-qemu-smp1.toml
+  --arch aarch64 \
+  --vmconfigs configs/vms/qemu/aarch64/nimbos-smp1.toml
 ```
 
 **启动后状态**：
@@ -780,7 +780,7 @@ vmconfigs = [
 
 ```bash
 # 启动时不创建VM，需要启用fs以便手动创建
-./axvisor.sh run --plat aarch64-generic --features fs,ept-level-4
+./axvisor.sh run --arch aarch64 --features fs
 ```
 
 **启动后状态**：
@@ -807,7 +807,7 @@ mkfs.vfat disk.img
 # 挂载并放入VM配置文件
 mkdir -p mnt
 sudo mount disk.img mnt
-sudo cp configs/vms/*.toml mnt/
+find configs/vms -name "*.toml" -exec sudo cp {} mnt/ \;
 sudo umount mnt
 ```
 
@@ -816,9 +816,9 @@ sudo umount mnt
 ```bash
 # 同时启用文件系统和自动启动VM
 ./axvisor.sh run \
-  --plat aarch64-generic \
-  --vmconfigs configs/vms/nimbos-aarch64-qemu-smp1.toml \
-  --features fs,ept-level-4 \
+  --arch aarch64 \
+  --vmconfigs configs/vms/qemu/aarch64/nimbos-smp1.toml \
+  --features fs \
   --arceos-args "BUS=mmio,BLK=y,DISK_IMG=disk.img,MEM=8g,LOG=info"
 ```
 
@@ -843,10 +843,10 @@ ArceOS 默认使用 **FAT32** 文件系统。如需使用其他文件系统，�
 ```bash
 # 使用EXT4文件系统（需要创建ext4格式的磁盘镜像）
 ./axvisor.sh run \
-  --plat aarch64-generic \
-  --vmconfigs configs/vms/nimbos-aarch64-qemu-smp1.toml \
-  --features fs,ept-level-4 \
-  --arceos-features ext4fs \
+  --arch aarch64 \
+  --vmconfigs configs/vms/qemu/aarch64/nimbos-smp1.toml \
+  --features fs \
+  --arceos-features ext4 \
   --arceos-args "BUS=mmio,BLK=y,DISK_IMG=disk-ext4.img,MEM=8g"
 ```
 
@@ -862,9 +862,9 @@ ArceOS 默认使用 **FAT32** 文件系统。如需使用其他文件系统，�
 
 # 2. 启动AxVisor（VM会自动启动）
 ./axvisor.sh run \
-  --plat aarch64-generic \
-  --features fs,ept-level-4 \
-  --vmconfigs configs/vms/nimbos-aarch64-qemu-smp1.toml \
+  --arch aarch64 \
+  --features fs \
+  --vmconfigs configs/vms/qemu/aarch64/nimbos-smp1.toml \
   --arceos-args "BUS=mmio,BLK=y,DISK_IMG=tmp/nimbos-aarch64.img,LOG=info"
 
 # 3. 在Shell中操作（VM已运行）
@@ -888,8 +888,8 @@ axvisor:/$ log debug          # 调整日志级别
 
 # 2. 启动AxVisor（不指定vmconfigs，不自动启动VM）
 ./axvisor.sh run \
-  --plat aarch64-generic \
-  --features fs,ept-level-4 \
+  --arch aarch64 \
+  --features fs \
   --arceos-args "BUS=mmio,BLK=y,DISK_IMG=tmp/nimbos-aarch64.img,LOG=info"
 
 # 3. 在Shell中手动创建和启动VM
@@ -897,10 +897,10 @@ axvisor:/$ vm list
 No virtual machines found.
 
 axvisor:/$ ls /              # 浏览文件系统
-nimbos-aarch64-qemu-smp1.toml
+nimbos-smp1.toml
 ...
 
-axvisor:/$ vm create /nimbos-aarch64-qemu-smp1.toml
+axvisor:/$ vm create /nimbos-smp1.toml
 ✓ Successfully created VM from config
 
 axvisor:/$ vm list -a
@@ -924,9 +924,9 @@ ID    NAME           STATE         VCPU   MEMORY
 ```bash
 # 启动AxVisor，自动启动第一个VM
 ./axvisor.sh run \
-  --plat aarch64-generic \
-  --features fs,ept-level-4 \
-  --vmconfigs configs/vms/vm1.toml \
+  --arch aarch64 \
+  --features fs \
+  --vmconfigs configs/vms/qemu/aarch64/vm1.toml \
   --arceos-args "BUS=mmio,BLK=y,DISK_IMG=disk.img,LOG=info"
 
 # Shell中查看和创建更多VM

@@ -2,8 +2,9 @@
 name = "axvisor"
 authors = ["Keyang Hu <keyang.hu@qq.com>", "周睿 <zrufo747@outlook.com>"]
 edition.workspace = true
-version = "0.5.5"
+version = "0.5.23"
 description = "A lightweight type-1 hypervisor based on ArceOS"
+publish = false
 repository = "https://github.com/arceos-hypervisor/axvisor"
 homepage = "https://github.com/arceos-hypervisor/axvisor"
 documentation = "https://docs.rs/axvisor"
@@ -20,13 +21,9 @@ include = [
     "configs/**",
     "scripts/**",
     "xtask/src/**",
-    "rust-toolchain.toml",
     "README.md",
     "LICENSE*",
 ]
-
-[profile.release]
-lto = true
 
 [[bin]]
 name = "axvisor"
@@ -35,85 +32,94 @@ path = "src/main.rs"
 [[bin]]
 name = "xtask"
 path = "xtask/src/main.rs"
+test = false
+required-features = ["host-xtask"]
+
+[[test]]
+name = "axtest"
+path = "tests/axtest.rs"
+harness = false
+required-features = ["axtest"]
 
 [features]
 default = []
-ept-level-4 = []
-fs = ["ax-std/fs"]
-sstc = ["riscv_vcpu/sstc"]
-dyn-plat = ["ax-std/plat-dyn", "dep:axplat-dyn"]
-rockchip-soc = ["dep:axplat-dyn", "axplat-dyn/rockchip-soc"]
-rk3568-clk = ["dep:axplat-dyn", "axplat-dyn/rk3568-clk"]
-sdmmc = ["dep:axplat-dyn", "axplat-dyn/sdmmc"]
-rockchip-pm = ["dep:axplat-dyn", "axplat-dyn/rockchip-pm"]
-phytium-blk = ["dep:axplat-dyn", "axplat-dyn/phytium-blk"]
-serial = ["dep:axplat-dyn", "axplat-dyn/serial"]
+host-xtask = []
+axtest = []
+fs = ["ax-std/ext4fs", "ax-std/fatfs", "axvm/host-fs"]
+sstc = ["axvm/sstc"]
+rockchip-soc = ["ax-driver/rockchip-soc"]
+rockchip-sdhci = ["ax-driver/rockchip-sdhci", "ax-driver/rockchip-soc"]
+phytium-mci = ["ax-driver/phytium-mci"]
+ahci-fdt = ["ax-driver/ahci-fdt"]
+sdmmc = [
+    "ax-driver/rockchip-sdhci",
+    "ax-driver/rockchip-soc",
+]
+rockchip-pm = ["ax-driver/rockchip-pm"]
+stack-protector = ["ax-std/stack-protector"]
+backtrace = ["ax-std/backtrace", "dep:axbacktrace"]
+test-backtrace-panic = ["backtrace"]
+test-panic-no-backtrace = ["dep:axbacktrace"]
 
-[target.'cfg(not(any(windows, unix)))'.dependencies]
-bitflags = "2.2"
-cfg-if = "1.0"
-ax-cpumask = { workspace = true }
-ax-kernel-guard = { workspace = true }
-ax-kspin = { workspace = true }
-lazy_static = {version = "1.5", default-features = false, features = ["spin_no_std"]}
-ax-lazyinit = { workspace = true }
+[dependencies]
+spin = { workspace = true }
+ax-kspin.workspace = true
+ax-crate-interface = { workspace = true }
+
+[target.'cfg(any(not(any(windows, unix)), target_env = "musl"))'.dependencies]
+anyhow.workspace = true
 log = "0.4"
-spin = "0.10"
-ax-timer-list = { workspace = true }
-hashbrown = "0.14"
 
 # System dependent modules provided by ArceOS.
-ax-std = { workspace = true, features = ["paging", "irq", "multitask", "task-ext", "smp", "hv"] }
-ax-hal = { workspace = true, features = ["paging", "irq", "smp", "hv", "axvisor-linker"] }
+ax-std = { workspace = true, default-features = false, features = [
+  "alloc",
+  "fd",
+  "ext-ld",
+  "paging",
+  "irq",
+  "multitask",
+  "task-ext",
+  "smp",
+  "hv",
+  "tls",
+  "std-compat",
+] }
+ax-hal = { workspace = true, features = ["paging", "irq", "smp", "hv"] }
 # System dependent modules provided by ArceOS-Hypervisor (bare-metal only)
-axaddrspace = { workspace = true }
-axhvc = { workspace = true }
 # ax-runtime = { version = "=0.3.0-preview.1", features = ["alloc", "irq", "paging", "smp", "multitask"] }
-axvcpu = { workspace = true }
-axvm = { workspace = true }
+axvm = { workspace = true, default-features = false, features = ["tls"] }
+axvmconfig = { workspace = true, default-features = false }
+axvm-types = { workspace = true }
+# Device emulation framework + virtio-net MMIO device model (AxVisor glue only).
 axdevice = { workspace = true }
 axdevice_base = { workspace = true }
-axvisor_api = { workspace = true }
+axvirtio-net = { workspace = true }
+axvirtio-switch = { workspace = true }
+ax-runtime = { workspace = true, features = ["irq"] }
+rd-net.workspace = true
+rdrive.workspace = true
 # System independent crates provided by ArceOS
-ax-errno = { workspace = true }
-axklib = { workspace = true }
-# ax-cpu = { version = "0.3.0-preview.8", features = ["arm-el2"] }
-byte-unit = {version = "5", default-features = false, features = ["byte"]}
-ax-crate-interface = { workspace = true }
-extern-trait = "0.4"
-fdt-parser = "0.4"
-ax-memory-addr = { workspace = true }
-ax-page-table-entry = { workspace = true, features = ["arm-el2"] }
-ax-page-table-multiarch = { workspace = true }
-ax-percpu = { workspace = true, features = ["arm-el2", "non-zero-vma"] }
-rdif-intc = "0.14"
-rdrive = "0.20"
-axplat-dyn = { path = "../../platform/axplat-dyn", optional = true, default-features = false }
+ax-driver = { workspace = true, features = ["net"] }
+axplat-dyn.workspace = true
+axbacktrace = { workspace = true, optional = true }
 
-[target.'cfg(target_arch = "x86_64")'.dependencies]
-axplat-x86-qemu-q35 = { path = "../../platform/x86-qemu-q35", default-features = false, features = ["reboot-on-system-off", "irq", "smp"] }
-ax-config = { workspace = true, features = ["plat-dyn"] }
-[target.'cfg(target_arch = "aarch64")'.dependencies]
-aarch64-cpu-ext = "0.1"
-arm-gic-driver = {version = "0.17", features = ["rdif"]}
-
-[target.'cfg(target_arch = "loongarch64")'.dependencies]
-ax-plat-loongarch64-qemu-virt = { path = "../../components/axplat_crates/platforms/axplat-loongarch64-qemu-virt", default-features = false, features = ["irq", "smp"] }
 [target.'cfg(target_arch = "riscv64")'.dependencies]
-axplat-riscv64-qemu-virt-hv = { workspace = true }
-riscv_vcpu = { workspace = true }
-riscv_vplic = { workspace = true }
+axplat-dyn = { workspace = true, features = ["hv"] }
+
+[dev-dependencies]
+axtest.workspace = true
+
 # xtask dependencies (only used on host platforms)
-[target.'cfg(any(windows, unix))'.dependencies]
+[target.'cfg(any(windows, all(unix, not(target_env = "musl"))))'.dependencies]
 anyhow.workspace = true
 axbuild = { workspace = true }
 clap = { version = "4.6", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 
 [build-dependencies]
-ax-config = { workspace = true, features = ["plat-dyn"] }
+anyhow = "1.0"
 prettyplease = "0.2"
+proc-macro2 = "1.0"
 quote = "1.0"
 syn = "2.0"
 toml = "0.9"
-anyhow = "1.0"

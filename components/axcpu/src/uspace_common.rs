@@ -1,6 +1,6 @@
 use ax_memory_addr::VirtAddr;
 
-use crate::{TrapFrame, trap::PageFaultFlags, uspace::ExceptionInfo};
+use crate::{trap::PageFaultFlags, uspace::ExceptionInfo};
 
 /// A reason as to why the control of the CPU is returned from
 /// the user space to the kernel.
@@ -30,87 +30,26 @@ pub enum ExceptionKind {
     IllegalInstruction,
     /// A misaligned access exception.
     Misaligned,
+    /// An integer arithmetic exception, i.e. x86 `#DE` (divide-by-zero or the
+    /// `INT_MIN / -1` overflow). On x86 this is a real CPU trap that must become
+    /// `SIGFPE`; the other architectures do not trap on integer divide-by-zero,
+    /// so they never produce this kind.
+    ArithmeticError,
     /// Other kinds of exceptions.
     Other,
 }
 
-#[repr(C)]
-#[derive(Debug, PartialEq, Eq)]
-struct ExceptionTableEntry {
-    #[cfg(target_arch = "aarch64")]
-    from: i32,
-    #[cfg(target_arch = "aarch64")]
-    to: i32,
-    #[cfg(not(target_arch = "aarch64"))]
-    from: usize,
-    #[cfg(not(target_arch = "aarch64"))]
-    to: usize,
-}
-
-impl ExceptionTableEntry {
-    #[inline]
-    fn source_addr(&self) -> usize {
-        #[cfg(target_arch = "aarch64")]
-        {
-            let base = (&self.from as *const i32) as isize;
-            (base + self.from as isize) as usize
-        }
-
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            self.from
-        }
-    }
-
-    #[inline]
-    fn to_addr(&self) -> usize {
-        #[cfg(target_arch = "aarch64")]
-        {
-            let base = (&self.to as *const i32) as isize;
-            (base + self.to as isize) as usize
-        }
-
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            self.to
-        }
-    }
-}
-
-unsafe extern "C" {
-    static _ex_table_start: [ExceptionTableEntry; 0];
-    static _ex_table_end: [ExceptionTableEntry; 0];
-}
-
-impl TrapFrame {
-    pub(crate) fn fixup_exception(&mut self) -> bool {
-        let entries = unsafe {
-            core::slice::from_raw_parts(
-                _ex_table_start.as_ptr(),
-                _ex_table_end
-                    .as_ptr()
-                    .offset_from_unsigned(_ex_table_start.as_ptr()),
-            )
-        };
-        match entries.binary_search_by_key(&self.ip(), ExceptionTableEntry::source_addr) {
-            Ok(entry) => {
-                self.set_ip(entries[entry].to_addr());
-                true
-            }
-            Err(_) => false,
-        }
-    }
-}
-
-pub(crate) fn init_exception_table() {
-    // Sort exception table
-    let ex_table = unsafe {
-        core::slice::from_raw_parts_mut(
-            _ex_table_start.as_ptr().cast_mut(),
-            _ex_table_end
-                .as_ptr()
-                .offset_from_unsigned(_ex_table_start.as_ptr()),
-        )
-    };
-    ex_table.sort_unstable_by_key(ExceptionTableEntry::source_addr);
+/// Architecture-neutral syndrome fields for user-space exceptions.
+///
+/// The meaning of each field remains architecture-specific, but this shape
+/// gives OS code a single way to log or forward the raw trap details without
+/// reaching into every architecture's private register type.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExceptionSyndrome {
+    /// Raw syndrome/status register value when the architecture exposes one.
+    pub raw: u64,
+    /// Primary exception class or code.
+    pub class: u64,
+    /// Architecture-specific instruction syndrome or subcode.
+    pub iss: u64,
 }

@@ -1,0 +1,455 @@
+extern crate alloc;
+
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
+use core::ptr::NonNull;
+
+use crab_usb::{
+    DwcNewParams, DwcParams, NamedResetLine, UdphyParam, Usb2PhyParam, Usb2PhyPortId,
+    UsbPhyInterfaceMode, usb_if::DrMode,
+};
+use fdt_edit::{Fdt, Node, NodeType, Phandle, RegFixed};
+use log::{debug, info, warn};
+use rdrive::{
+    probe::{
+        OnProbeError,
+        fdt::{
+            ClockLine, ResetLine as RdriveResetLine, apply_assigned_clocks, clock_lines,
+            reset_lines,
+        },
+    },
+    register::{FdtInfo, ProbeFdt},
+};
+
+use super::{ProbeFdtUsbHost, usb_kernel};
+use crate::mmio::iomap;
+
+const DRIVER_NAME: &str = "usb-dwc-xhci";
+
+crate::model_register!(
+    name: "USB DWC xHCI",
+    level: ProbeLevel::PostKernel,
+    priority: ProbePriority::DEFAULT,
+    probe_kinds: &[
+        ProbeKind::Fdt {
+            compatibles: &["snps,dwc3"],
+            on_probe: probe
+        }
+    ],
+);
+
+struct UsbResetLine(RdriveResetLine);
+
+impl crab_usb::ResetLine for UsbResetLine {
+    fn assert(&self) {
+        if let Err(err) = self.0.assert() {
+            warn!(
+                "failed to assert RK3588 reset {:?} ({:#x}): {err}",
+                self.0.name(),
+                self.0.id().raw()
+            );
+        }
+    }
+
+    fn deassert(&self) {
+        if let Err(err) = self.0.deassert() {
+            warn!(
+                "failed to deassert RK3588 reset {:?} ({:#x}): {err}",
+                self.0.name(),
+                self.0.id().raw()
+            );
+        }
+    }
+}
+
+struct Usb2PhyResources {
+    port_name: String,
+    reg: usize,
+    grf: Phandle,
+    resets: Vec<NamedResetLine>,
+    clocks: Vec<ClockLine>,
+}
+
+struct UsbdpPhyResources {
+    id: usize,
+    reg: RegFixed,
+    u2phy_grf: Phandle,
+    usb_grf: Phandle,
+    usbdpphy_grf: Phandle,
+    vo_grf: Phandle,
+    dp_lane_mux: Vec<u32>,
+    resets: Vec<NamedResetLine>,
+    clocks: Vec<ClockLine>,
+}
+
+struct DwcResources {
+    ctrl: RegFixed,
+    clocks: Vec<ClockLine>,
+    ctrl_resets: Vec<NamedResetLine>,
+    usb2: Usb2PhyResources,
+    usbdp: UsbdpPhyResources,
+    params: DwcParams,
+}
+
+fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
+    let info = probe.info();
+    match prop_str(info.node.as_node(), "dr_mode") {
+        Some("host") => {}
+        Some(mode) => {
+            debug!("skip DWC3 node {} because dr_mode={mode}", info.node.name());
+            return Err(OnProbeError::NotMatch);
+        }
+        None => {
+            debug!(
+                "skip DWC3 node {} because dr_mode is missing",
+                info.node.name()
+            );
+            return Err(OnProbeError::NotMatch);
+        }
+    }
+
+    let fdt = live_fdt()?;
+    let resources = collect_resources(info, &fdt)?;
+
+    enable_clocks(&resources.clocks)?;
+
+    let ctrl = map_reg(resources.ctrl)?;
+    let phy = map_reg(resources.usbdp.reg)?;
+    let u2phy_grf = map_phandle_reg(&fdt, resources.usbdp.u2phy_grf, "rockchip,u2phy-grf")?;
+    let usb_grf = map_phandle_reg(&fdt, resources.usbdp.usb_grf, "rockchip,usb-grf")?;
+    let usbdpphy_grf =
+        map_phandle_reg(&fdt, resources.usbdp.usbdpphy_grf, "rockchip,usbdpphy-grf")?;
+    let vo_grf = map_phandle_reg(&fdt, resources.usbdp.vo_grf, "rockchip,vo-grf")?;
+    let usb2phy_grf = map_phandle_reg(&fdt, resources.usb2.grf, "usb2phy-grf")?;
+
+    let usb2_port = Usb2PhyPortId::from_node_name(&resources.usb2.port_name).ok_or_else(|| {
+        OnProbeError::other(format!(
+            "unsupported USB2 PHY port name {}",
+            resources.usb2.port_name
+        ))
+    })?;
+
+    let host = crab_usb::USBHost::new_dwc(DwcNewParams {
+        ctrl,
+        phy,
+        phy_param: UdphyParam {
+            id: resources.usbdp.id,
+            u2phy_grf,
+            usb_grf,
+            usbdpphy_grf,
+            vo_grf,
+            dp_lane_mux: &resources.usbdp.dp_lane_mux,
+            rst_list: &resources.usbdp.resets,
+        },
+        usb2_phy_param: Usb2PhyParam {
+            reg: resources.usb2.reg,
+            port_kind: usb2_port,
+            usb_grf: usb2phy_grf,
+            rst_list: &resources.usb2.resets,
+        },
+        rst_list: &resources.ctrl_resets,
+        params: resources.params,
+        kernel: usb_kernel(),
+    })
+    .map_err(|err| {
+        OnProbeError::other(format!(
+            "failed to create DWC xHCI host for [{}]: {err}",
+            info.node.name()
+        ))
+    })?;
+
+    let node_name = probe.info().node.name().to_string();
+    let irq = probe.register_usb_host(DRIVER_NAME, host)?;
+    info!(
+        "DWC xHCI driver initialized successfully for {} with irq {:?}",
+        node_name, irq
+    );
+    Ok(())
+}
+
+fn collect_resources(info: &FdtInfo<'_>, fdt: &Fdt) -> Result<DwcResources, OnProbeError> {
+    let ctrl = info
+        .node
+        .regs()
+        .into_iter()
+        .next()
+        .ok_or_else(|| OnProbeError::other(format!("[{}] has no reg", info.node.name())))?;
+    let (usb2_port, usbdp_port) = parse_phys(info.node.as_node())?;
+    let usb2 = collect_usb2_phy(fdt, usb2_port)?;
+    let usbdp = collect_usbdp_phy(fdt, usbdp_port)?;
+
+    let mut clocks = Vec::new();
+    if let Some(parent) = info.node.parent() {
+        apply_assigned_clocks(parent)?;
+        clocks.extend(clock_lines(parent)?);
+    }
+    clocks.extend(info.clock_lines()?);
+    clocks.extend(usb2.clocks.iter().cloned());
+    clocks.extend(usbdp.clocks.iter().cloned());
+
+    Ok(DwcResources {
+        ctrl,
+        clocks,
+        ctrl_resets: parse_resets(info.node)?,
+        usb2,
+        usbdp,
+        params: parse_dwc_params(info.node.as_node()),
+    })
+}
+
+fn collect_usb2_phy(fdt: &Fdt, port_phandle: Phandle) -> Result<Usb2PhyResources, OnProbeError> {
+    let port = fdt
+        .get_by_phandle(port_phandle)
+        .ok_or_else(|| OnProbeError::other(format!("USB2 PHY port {port_phandle:?} not found")))?;
+    let phy = port.parent().ok_or_else(|| {
+        OnProbeError::other(format!("[{}] has no USB2 PHY parent node", port.name()))
+    })?;
+    let grf = phy
+        .parent()
+        .and_then(|node| node.as_node().phandle())
+        .ok_or_else(|| {
+            OnProbeError::other(format!("[{}] has no USB2 PHY GRF parent", phy.name()))
+        })?;
+    let phy_reg = phy
+        .regs()
+        .into_iter()
+        .next()
+        .ok_or_else(|| OnProbeError::other(format!("[{}] has no reg", phy.name())))?;
+    let reg = phy_reg.child_bus_address as usize;
+
+    Ok(Usb2PhyResources {
+        port_name: port.name().to_string(),
+        reg,
+        grf,
+        resets: parse_resets(phy)?,
+        clocks: {
+            apply_assigned_clocks(phy)?;
+            clock_lines(phy)?
+        },
+    })
+}
+
+fn collect_usbdp_phy(fdt: &Fdt, port_phandle: Phandle) -> Result<UsbdpPhyResources, OnProbeError> {
+    let port = fdt
+        .get_by_phandle(port_phandle)
+        .ok_or_else(|| OnProbeError::other(format!("USBDP PHY port {port_phandle:?} not found")))?;
+    let phy = port.parent().ok_or_else(|| {
+        OnProbeError::other(format!("[{}] has no USBDP PHY parent node", port.name()))
+    })?;
+    let reg = phy
+        .regs()
+        .into_iter()
+        .next()
+        .ok_or_else(|| OnProbeError::other(format!("[{}] has no reg", phy.name())))?;
+
+    Ok(UsbdpPhyResources {
+        id: usbdp_phy_id(fdt, phy)?,
+        reg,
+        u2phy_grf: required_phandle_prop(phy.as_node(), "rockchip,u2phy-grf", phy.name())?,
+        usb_grf: required_phandle_prop(phy.as_node(), "rockchip,usb-grf", phy.name())?,
+        usbdpphy_grf: required_phandle_prop(phy.as_node(), "rockchip,usbdpphy-grf", phy.name())?,
+        vo_grf: required_phandle_prop(phy.as_node(), "rockchip,vo-grf", phy.name())?,
+        dp_lane_mux: phy
+            .as_node()
+            .get_property("rockchip,dp-lane-mux")
+            .map(|prop| prop.get_u32_iter().collect())
+            .unwrap_or_default(),
+        resets: parse_resets(phy)?,
+        clocks: {
+            apply_assigned_clocks(phy)?;
+            clock_lines(phy)?
+        },
+    })
+}
+
+fn parse_phys(node: &Node) -> Result<(Phandle, Phandle), OnProbeError> {
+    let phys = node
+        .get_property("phys")
+        .ok_or_else(|| OnProbeError::other(format!("[{}] has no phys", node.name())))?
+        .get_u32_iter()
+        .map(Phandle::from)
+        .collect::<Vec<_>>();
+    if phys.len() < 2 {
+        return Err(OnProbeError::other(format!(
+            "[{}] needs both USB2 and USB3 PHY phandles",
+            node.name()
+        )));
+    }
+    Ok((phys[0], phys[1]))
+}
+
+fn parse_resets(node: NodeType<'_>) -> Result<Vec<NamedResetLine>, OnProbeError> {
+    reset_lines(node)?
+        .into_iter()
+        .map(|reset| {
+            let name = reset.name().ok_or_else(|| {
+                OnProbeError::other(format!("[{}] has reset without reset-names", node.name()))
+            })?;
+            Ok(NamedResetLine::new(name.to_string(), UsbResetLine(reset)))
+        })
+        .collect()
+}
+
+fn parse_dwc_params(node: &Node) -> DwcParams {
+    let mut params = DwcParams {
+        dr_mode: DrMode::Host,
+        ..DwcParams::default()
+    };
+
+    match prop_str(node, "phy_type") {
+        Some("utmi") => params.hsphy_mode = UsbPhyInterfaceMode::Utmi,
+        Some("utmi_wide") => params.hsphy_mode = UsbPhyInterfaceMode::UtmiWide,
+        _ => {}
+    }
+
+    params.has_lpm_erratum = has_prop(node, &["snps,has-lpm-erratum"]);
+    params.is_utmi_l1_suspend = has_prop(node, &["snps,is-utmi-l1-suspend"]);
+    params.disable_scramble_quirk = has_prop(
+        node,
+        &["snps,disable_scramble_quirk", "snps,disable-scramble-quirk"],
+    );
+    params.u2exit_lfps_quirk =
+        has_prop(node, &["snps,u2exit_lfps_quirk", "snps,u2exit-lfps-quirk"]);
+    params.u2ss_inp3_quirk = has_prop(node, &["snps,u2ss_inp3_quirk", "snps,u2ss-inp3-quirk"]);
+    params.req_p1p2p3_quirk = has_prop(node, &["snps,req_p1p2p3_quirk", "snps,req-p1p2p3-quirk"]);
+    params.del_p1p2p3_quirk = has_prop(node, &["snps,del_p1p2p3_quirk", "snps,del-p1p2p3-quirk"]);
+    params.del_phy_power_chg_quirk = has_prop(
+        node,
+        &[
+            "snps,del_phy_power_chg_quirk",
+            "snps,del-phy-power-chg-quirk",
+            "snps,dis-del-phy-power-chg-quirk",
+        ],
+    );
+    params.lfps_filter_quirk =
+        has_prop(node, &["snps,lfps_filter_quirk", "snps,lfps-filter-quirk"]);
+    params.rx_detect_poll_quirk = has_prop(
+        node,
+        &["snps,rx_detect_poll_quirk", "snps,rx-detect-poll-quirk"],
+    );
+    params.dis_u3_susphy_quirk = has_prop(
+        node,
+        &["snps,dis_u3_susphy_quirk", "snps,dis-u3-susphy-quirk"],
+    );
+    params.dis_u2_susphy_quirk = has_prop(
+        node,
+        &["snps,dis_u2_susphy_quirk", "snps,dis-u2-susphy-quirk"],
+    );
+    params.dis_u1u2_quirk = has_prop(
+        node,
+        &[
+            "snps,dis_u1u2_quirk",
+            "snps,dis-u1-entry-quirk",
+            "snps,dis-u2-entry-quirk",
+        ],
+    );
+    params.dis_enblslpm_quirk = has_prop(
+        node,
+        &["snps,dis_enblslpm_quirk", "snps,dis-enblslpm-quirk"],
+    );
+    params.dis_u2_freeclk_exists_quirk = has_prop(
+        node,
+        &[
+            "snps,dis-u2-freeclk-exists-quirk",
+            "snps,dis_u2_freeclk_exists_quirk",
+        ],
+    );
+    params.tx_de_emphasis_quirk = has_prop(
+        node,
+        &["snps,tx_de_emphasis_quirk", "snps,tx-de-emphasis-quirk"],
+    );
+
+    params
+}
+
+fn enable_clocks(clocks: &[ClockLine]) -> Result<(), OnProbeError> {
+    for clock in clocks {
+        let id = clock.id().raw();
+        if id == 0 {
+            continue;
+        }
+
+        clock.enable()?;
+        debug!("DWC xHCI clock {:?} ({id:#x}) enabled", clock.name());
+    }
+    Ok(())
+}
+
+fn usbdp_phy_id(fdt: &Fdt, phy: NodeType<'_>) -> Result<usize, OnProbeError> {
+    let phy_path = phy.path();
+    if let Some(aliases) = fdt.all_nodes().find(|node| node.name() == "aliases") {
+        for prop in aliases.as_node().properties() {
+            let Some(suffix) = prop.name().strip_prefix("usbdp") else {
+                continue;
+            };
+            let Ok(id) = suffix.parse::<usize>() else {
+                continue;
+            };
+            if prop.as_str() == Some(phy_path.as_str()) {
+                return Ok(id);
+            }
+        }
+    }
+
+    if phy.name().contains("fed80000") {
+        return Ok(0);
+    }
+    if phy.name().contains("fed90000") {
+        return Ok(1);
+    }
+
+    Err(OnProbeError::other(format!(
+        "failed to resolve USBDP PHY id for {}",
+        phy.path()
+    )))
+}
+
+fn required_phandle_prop(node: &Node, name: &str, context: &str) -> Result<Phandle, OnProbeError> {
+    get_phandle_prop(node, name)
+        .ok_or_else(|| OnProbeError::other(format!("[{context}] has no {name}")))
+}
+
+fn get_phandle_prop(node: &Node, name: &str) -> Option<Phandle> {
+    node.get_property(name)
+        .and_then(|prop| prop.get_u32())
+        .map(Phandle::from)
+}
+
+fn prop_str<'a>(node: &'a Node, name: &str) -> Option<&'a str> {
+    node.get_property(name).and_then(|prop| prop.as_str())
+}
+
+fn has_prop(node: &Node, names: &[&str]) -> bool {
+    names.iter().any(|name| node.get_property(name).is_some())
+}
+
+fn live_fdt() -> Result<Fdt, OnProbeError> {
+    rdrive::with_fdt(Clone::clone).ok_or_else(|| OnProbeError::other("live FDT not found"))
+}
+
+fn map_phandle_reg(
+    fdt: &Fdt,
+    phandle: Phandle,
+    context: &str,
+) -> Result<NonNull<u8>, OnProbeError> {
+    let node = fdt
+        .get_by_phandle(phandle)
+        .ok_or_else(|| OnProbeError::other(format!("{context} phandle {phandle:?} not found")))?;
+    let reg = node.regs().into_iter().next().ok_or_else(|| {
+        OnProbeError::other(format!("[{}] has no reg for {context}", node.name()))
+    })?;
+    map_reg(reg)
+}
+
+fn map_reg(reg: RegFixed) -> Result<NonNull<u8>, OnProbeError> {
+    let size = align_up_4k((reg.size.unwrap_or(0x1000) as usize).max(1));
+    iomap(reg.address as usize, size)
+}
+
+fn align_up_4k(size: usize) -> usize {
+    const MASK: usize = 0xfff;
+    (size + MASK) & !MASK
+}

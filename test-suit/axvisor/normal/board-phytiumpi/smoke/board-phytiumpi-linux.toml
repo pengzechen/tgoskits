@@ -5,9 +5,7 @@ fail_regex = [
   "(?i)login incorrect",
   "(?i)permission denied",
 ]
-shell_init_cmd = "root"
-shell_prefix = "login:"
 success_regex = [
-  "(?m)^root@.*#\\s*$",
+  "(?m)^phytiumpi login:",
 ]
 timeout = 300

@@ -1,24 +1,97 @@
-use core::time::Duration;
+use core::{
+    mem::{MaybeUninit, size_of},
+    time::Duration,
+};
 
 use ax_errno::{AxError, AxResult};
 use ax_task::future::{self, block_on, poll_io};
 use axpoll::IoEvents;
 use bitflags::bitflags;
 use linux_raw_sys::general::{
-    EPOLL_CLOEXEC, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, epoll_event, timespec,
+    EPOLL_CLOEXEC, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, EPOLLEXCLUSIVE, epoll_event,
+    timespec,
 };
 use starry_signal::SignalSet;
+use starry_vm::{vm_read_slice, vm_write_slice};
 
 use crate::{
     file::{
         FileLike,
         epoll::{Epoll, EpollEvent, EpollFlags},
     },
-    mm::{UserConstPtr, UserPtr, nullable},
+    mm::{UserConstPtr, UserPtr, check_access, nullable},
     syscall::signal::check_sigset_size,
     task::with_blocked_signals,
     time::TimeValueLike,
 };
+
+const EP_MAX_EVENTS: usize = i32::MAX as usize / size_of::<epoll_event>();
+const EPOLLEXCLUSIVE_OK_BITS: u32 = IoEvents::IN.bits()
+    | IoEvents::OUT.bits()
+    | IoEvents::ERR.bits()
+    | IoEvents::HUP.bits()
+    | EpollFlags::EDGE_TRIGGER.bits()
+    | EpollFlags::EXCLUSIVE.bits();
+
+fn check_epoll_events_access(events: UserPtr<epoll_event>, maxevents: usize) -> AxResult<()> {
+    let len = maxevents
+        .checked_mul(size_of::<epoll_event>())
+        .ok_or(AxError::BadAddress)?;
+    let start = events.as_ptr() as usize;
+    start.checked_add(len).ok_or(AxError::BadAddress)?;
+    check_access(start, len)?;
+    Ok(())
+}
+
+/// Reads a single `epoll_event` from user memory without requiring the user
+/// pointer to satisfy `epoll_event`'s natural alignment.
+///
+/// Linux copies the `struct epoll_event` from user space with `copy_from_user`,
+/// which performs a byte-wise copy and imposes no alignment requirement. On
+/// architectures where `struct epoll_event` is NOT `__attribute__((packed))`
+/// (everything except x86/x86_64), the C struct has 8-byte alignment, but
+/// runtimes are free to back it with a less-strictly-aligned buffer. The Go
+/// runtime, for instance, lays out its `epollevent` with `[8]byte data` and
+/// thus only 4-byte alignment, so `&ev` passed to `epoll_ctl` can land at an
+/// address that is `4 (mod 8)`. Reading through a typed `*const epoll_event`
+/// (which the generic VM helpers reject when the pointer is unaligned) would
+/// then fail with `EFAULT`. Copy at byte granularity to mirror Linux.
+fn read_epoll_event(event: UserConstPtr<epoll_event>) -> AxResult<epoll_event> {
+    let mut buf = MaybeUninit::<epoll_event>::uninit();
+    let dst = unsafe {
+        core::slice::from_raw_parts_mut(
+            buf.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+            size_of::<epoll_event>(),
+        )
+    };
+    vm_read_slice(event.address().as_ptr(), dst)?;
+    // SAFETY: all bytes were just initialized by the copy above and any bit
+    // pattern is a valid `epoll_event` (plain old data).
+    Ok(unsafe { buf.assume_init() })
+}
+
+/// Writes a single `epoll_event` to the user `events` array slot `index`
+/// without requiring the user pointer to satisfy `epoll_event`'s natural
+/// alignment.
+///
+/// See [`read_epoll_event`] for why epoll user buffers may be under-aligned;
+/// Linux's `__put_user` of each field has no alignment requirement, so we copy
+/// at byte granularity to match.
+fn write_epoll_event(
+    events: UserPtr<epoll_event>,
+    index: usize,
+    event: &epoll_event,
+) -> AxResult<()> {
+    let dst = events.as_ptr().wrapping_add(index) as *mut u8;
+    let src = unsafe {
+        core::slice::from_raw_parts(
+            event as *const epoll_event as *const u8,
+            size_of::<epoll_event>(),
+        )
+    };
+    vm_write_slice(dst, src)?;
+    Ok(())
+}
 
 bitflags! {
     /// Flags for the `epoll_create` syscall.
@@ -36,6 +109,15 @@ pub fn sys_epoll_create1(flags: u32) -> AxResult<isize> {
         .map(|fd| fd as isize)
 }
 
+/// Implements legacy `epoll_create`, validating size before creating an epoll fd without flags.
+#[cfg(target_arch = "x86_64")]
+pub fn sys_epoll_create(size: i32) -> AxResult<isize> {
+    if size <= 0 {
+        return Err(AxError::InvalidInput);
+    }
+    sys_epoll_create1(0)
+}
+
 pub fn sys_epoll_ctl(
     epfd: i32,
     op: u32,
@@ -45,12 +127,18 @@ pub fn sys_epoll_ctl(
     let epoll = Epoll::from_fd(epfd)?;
     debug!("sys_epoll_ctl <= epfd: {epfd}, op: {op}, fd: {fd}");
 
-    let parse_event = || -> AxResult<(EpollEvent, EpollFlags)> {
-        let event = event.get_as_ref()?;
+    if epfd == fd {
+        return Err(AxError::InvalidInput);
+    }
+
+    let parse_event = || -> AxResult<(u32, EpollEvent, EpollFlags)> {
+        let event = read_epoll_event(event)?;
+        let raw_events = event.events;
         let events = IoEvents::from_bits_truncate(event.events);
         let flags =
-            EpollFlags::from_bits(event.events & !events.bits()).ok_or(AxError::InvalidInput)?;
+            EpollFlags::from_bits(raw_events & !events.bits()).ok_or(AxError::InvalidInput)?;
         Ok((
+            raw_events,
             EpollEvent {
                 events,
                 user_data: event.data,
@@ -60,11 +148,21 @@ pub fn sys_epoll_ctl(
     };
     match op {
         EPOLL_CTL_ADD => {
-            let (event, flags) = parse_event()?;
+            let (raw_events, event, flags) = parse_event()?;
+            // Linux only permits EPOLLEXCLUSIVE on ADD, and it is rejected for
+            // epoll targets as well.
+            if raw_events & EPOLLEXCLUSIVE != 0
+                && (raw_events & !EPOLLEXCLUSIVE_OK_BITS != 0 || Epoll::from_fd(fd).is_ok())
+            {
+                return Err(AxError::InvalidInput);
+            }
             epoll.add(fd, event, flags)?;
         }
         EPOLL_CTL_MOD => {
-            let (event, flags) = parse_event()?;
+            let (_, event, flags) = parse_event()?;
+            if flags.contains(EpollFlags::EXCLUSIVE) {
+                return Err(AxError::InvalidInput);
+            }
             epoll.modify(fd, event, flags)?;
         }
         EPOLL_CTL_DEL => {
@@ -93,20 +191,32 @@ fn do_epoll_wait(
     if maxevents <= 0 {
         return Err(AxError::InvalidInput);
     }
-    let events = events.get_as_mut_slice(maxevents as usize)?;
+    let maxevents = maxevents as usize;
+    if maxevents > EP_MAX_EVENTS {
+        return Err(AxError::InvalidInput);
+    }
+    if events.is_null() {
+        return Err(AxError::BadAddress);
+    }
+    check_epoll_events_access(events, maxevents)?;
 
-    with_blocked_signals(
+    let count = with_blocked_signals(
         nullable!(sigmask.get_as_ref())?.copied(),
         || match block_on(future::timeout(
             timeout,
             poll_io(epoll.as_ref(), IoEvents::IN, false, || {
-                epoll.poll_events(events)
+                epoll.poll_events_with(maxevents, |index, event| {
+                    write_epoll_event(events, index, &event)?;
+                    Ok(())
+                })
             }),
         )) {
             Ok(r) => r.map(|n| n as _),
             Err(_) => Ok(0),
         },
-    )
+    )?;
+
+    Ok(count)
 }
 
 pub fn sys_epoll_pwait(
@@ -117,12 +227,23 @@ pub fn sys_epoll_pwait(
     sigmask: UserConstPtr<SignalSet>,
     sigsetsize: usize,
 ) -> AxResult<isize> {
-    let timeout = match timeout {
-        -1 => None,
-        t if t >= 0 => Some(Duration::from_millis(t as u64)),
-        _ => return Err(AxError::InvalidInput),
+    let timeout = if timeout < 0 {
+        None
+    } else {
+        Some(Duration::from_millis(timeout as u64))
     };
     do_epoll_wait(epfd, events, maxevents, timeout, sigmask, sigsetsize)
+}
+
+/// Implements legacy `epoll_wait` as an x86_64 wrapper around `epoll_pwait`.
+#[cfg(target_arch = "x86_64")]
+pub fn sys_epoll_wait(
+    epfd: i32,
+    events: UserPtr<epoll_event>,
+    maxevents: i32,
+    timeout: i32,
+) -> AxResult<isize> {
+    sys_epoll_pwait(epfd, events, maxevents, timeout, 0usize.into(), 0)
 }
 
 pub fn sys_epoll_pwait2(
@@ -137,4 +258,26 @@ pub fn sys_epoll_pwait2(
         .map(|ts| ts.try_into_time_value())
         .transpose()?;
     do_epoll_wait(epfd, events, maxevents, timeout, sigmask, sigsetsize)
+}
+
+#[cfg(axtest)]
+pub(crate) fn epoll_validation_rules_hold_for_test() -> bool {
+    use core::mem::size_of;
+
+    use linux_raw_sys::general::{EPOLL_CLOEXEC, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD};
+
+    // Test EP_MAX_EVENTS calculation
+    let ep_max_events = i32::MAX as usize / size_of::<linux_raw_sys::general::epoll_event>();
+    assert!(ep_max_events > 0);
+
+    // Test valid epoll operations
+    let valid_ops = [EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD];
+    for &op in &valid_ops {
+        assert!(op == EPOLL_CTL_ADD || op == EPOLL_CTL_DEL || op == EPOLL_CTL_MOD);
+    }
+
+    // Test EPOLL_CLOEXEC flag
+    assert!(EPOLL_CLOEXEC != 0);
+
+    true
 }

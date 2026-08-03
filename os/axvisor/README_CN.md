@@ -65,11 +65,11 @@ AxVisor 基于 Rust 生态系统构建，通过扩展的 xtask 工具链提供�
 
 ## 配置文件
 
-AxVisor 使用分层配置系统，包含硬件平台配置和客户机配置两部分，均采用 TOML 格式。
+AxVisor 使用分层配置系统，包含 board 运行配置和客户机配置两部分，均采用 TOML 格式。
 
-### 硬件平台配置
+### Board 运行配置
 
-硬件平台配置文件位于 `configs/board/` 目录下，每个配置文件都对应了一个经过我们验证的开发板（或 QEMU 平台架构）。其中指定了目标架构、功能特性、驱动支持、日志级别以及构建选项。
+Board 运行配置位于 `configs/board/` 目录下，每个配置文件都对应了一个经过验证的开发板或 QEMU 架构组合。其中指定目标架构、功能特性、驱动支持、日志级别以及构建选项；平台实现本身固定走 `axplat-dyn`，不再由这里选择平台 crate。
 
 > 客户机配置项 `vm_configs` 默认并没有指定，在实际使用时需要进行指定!
 
@@ -77,11 +77,11 @@ AxVisor 使用分层配置系统，包含硬件平台配置和客户机配置两
 
 客户机配置文件位于 `configs/vms/` 目录下，定义了客户机的运行参数，包括基本信息、内核配置、内存区域以及设备配置等详细信息。
 
-配置文件命名格式为 `<os>-<arch>-board_or_cpu-smpx`，其中 `<os>` 是客户机系统名字（如 `arceos`、`linux`、`nimbos`），`<arch>` 是架构（如 `aarch64`、`x86_64`、`riscv64`），`board_or_cpu` 是硬件开发板或 CPU 名称，`smpx` 是分配给客户机的 CPU 数量。
+客户机配置按平台优先组织。QEMU 配置位于 `configs/vms/qemu/<arch>/`，实体板卡配置位于 `configs/vms/<board>/`。文件名只保留客户机系统和变体，例如 `configs/vms/qemu/aarch64/arceos-smp1.toml` 或 `configs/vms/roc-rk3568-pc/linux-smp1.toml`。
 
 ## 编译
 
-AxVisor 使用 xtask 工具进行构建管理，支持多种硬件平台和配置选项。快速构建及运行 AxVisor，请参见配置套文档中的[快速上手](https://arceos-hypervisor.github.io/axvisorbook/docs/category/quickstart)章节。
+AxVisor 使用 xtask 工具进行构建管理，支持多种硬件平台和配置选项。快速构建及运行 AxVisor，请参见配置套文档中的[快速上手](https://arceos-hypervisor.github.io/axvisorbook/docs/quickstart)章节。
 
 1. **查看可用板级配置**：使用 `cargo xtask config ls` 查看 `configs/board/` 目录下可用的板级配置名。
 
@@ -90,8 +90,8 @@ AxVisor 使用 xtask 工具进行构建管理，支持多种硬件平台和配�
 3. **执行构建**：使用 `cargo xtask build` 根据 `.build.toml` 编译 AxVisor。若不想依赖 `.build.toml`，也可以直接指定配置文件，例如：`cargo xtask build --config configs/board/<board_name>.toml`。
 
 4. **运行 QEMU 或开发板**：
-   - QEMU：`cargo xtask qemu --config configs/board/qemu-aarch64.toml --qemu-config .github/workflows/qemu-aarch64.toml --vmconfigs configs/vms/arceos-aarch64-qemu-smp1.toml`
-   - U-Boot 开发板流程：`cargo xtask uboot --config configs/board/roc-rk3568-pc.toml --uboot-config .github/workflows/uboot.toml --vmconfigs configs/vms/arceos-aarch64-rk3568-smp1.toml`
+   - QEMU：`cargo xtask qemu --config configs/board/qemu-aarch64.toml --qemu-config .github/workflows/qemu-aarch64.toml --vmconfigs configs/vms/qemu/aarch64/arceos-smp1.toml`
+   - U-Boot 开发板流程：`cargo xtask uboot --config configs/board/roc-rk3568-pc.toml --uboot-config .github/workflows/uboot.toml --vmconfigs configs/vms/roc-rk3568-pc/arceos-smp1.toml`
 
 如果是本地快速验证，也可以直接使用 `./scripts/quick-start.sh` 启动当前脚本支持的 QEMU 和开发板平台。具体示例见 [QEMU 快速上手指南](doc/qemu-quickstart_cn.md)。
 

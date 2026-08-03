@@ -1,6 +1,6 @@
 [package]
 name = "ax-hal"
-version = "0.5.12"
+version = "0.5.30"
 repository = "https://github.com/rcore-os/tgoskits"
 edition.workspace = true
 authors = ["Yuekai Jia <equation618@gmail.com>"]
@@ -9,63 +9,43 @@ license.workspace = true
 
 [features]
 smp = [
-    "ax-plat-x86-pc?/smp",
-    "ax-plat-aarch64-qemu-virt?/smp",
-    "ax-plat-riscv64-qemu-virt?/smp",
-    "ax-plat-loongarch64-qemu-virt?/smp",
-    "axplat-dyn?/smp",
+    "axplat-dyn/smp",
     "ax-plat/smp",
 ]
 irq = [
-    "ax-plat-x86-pc?/irq",
-    "ax-plat-aarch64-qemu-virt?/irq",
-    "ax-plat-riscv64-qemu-virt?/irq",
-    "ax-plat-loongarch64-qemu-virt?/irq",
     "ax-plat/irq",
-    "axplat-dyn?/irq",
+    "axplat-dyn/irq",
+    "dep:ax-kspin",
 ]
 fp-simd = [
     "ax-cpu/fp-simd",
-    "ax-plat-x86-pc?/fp-simd",
-    "ax-plat-aarch64-qemu-virt?/fp-simd",
-    "ax-plat-riscv64-qemu-virt?/fp-simd",
-    "ax-plat-loongarch64-qemu-virt?/fp-simd",
-    "axplat-dyn?/fp-simd",
+    "axplat-dyn/fp-simd",
 ]
-rtc = [
-    "ax-plat-x86-pc?/rtc",
-    "ax-plat-aarch64-qemu-virt?/rtc",
-    "ax-plat-riscv64-qemu-virt?/rtc",
-    "ax-plat-loongarch64-qemu-virt?/rtc",
-    "axplat-dyn?/rtc",
-]
+xuantie-c9xx = ["ax-cpu/xuantie-c9xx"]
+rtc = ["axplat-dyn/rtc"]
+el1-phys-timer = ["axplat-dyn/el1-phys-timer"]
 paging = [
     "dep:ax-alloc",
     "dep:ax-page-table-multiarch",
     "ax-page-table-multiarch/ax-errno",
 ]
-tls = ["ax-cpu/tls"]
-uspace = ["paging", "ax-cpu/uspace", "axplat-dyn?/uspace"]
-hv = ["paging", "ax-cpu/arm-el2", "ax-percpu/arm-el2", "axplat-dyn?/hv"]
-axvisor-linker = []
-
-# Custom or default platforms
-myplat = []
-plat-dyn = ["axplat-dyn"]
-defplat = [
-    "dep:ax-plat-x86-pc",
-    "dep:ax-plat-aarch64-qemu-virt",
-    "dep:ax-plat-riscv64-qemu-virt",
-    "dep:ax-plat-loongarch64-qemu-virt",
+tls = ["ax-cpu/tls", "cpu-local/tls", "axplat-dyn/tls"]
+uspace = ["paging", "ax-cpu/uspace", "axplat-dyn/uspace"]
+hv = [
+    "paging",
+    "ax-cpu/exception-table",
+    "axplat-dyn/hv",
 ]
+host-test = ["cpu-local/host-test", "ax-cpu/host-test", "ax-percpu/host-test"]
 
 default = []
 ipi = ["irq"]
 
 [dependencies]
 ax-alloc = { workspace = true, optional = true }
-ax-config.workspace = true
 ax-cpu.workspace = true
+cpu-local.workspace = true
+ax-kspin = { workspace = true, optional = true }
 ax-plat.workspace = true
 cfg-if.workspace = true
 fdt-parser = "0.4"
@@ -74,24 +54,10 @@ ax-kernel-guard.workspace = true
 log.workspace = true
 ax-memory-addr.workspace = true
 ax-page-table-multiarch = { workspace = true, optional = true }
-ax-percpu = { workspace = true, features = ["non-zero-vma"] }
+ax-percpu.workspace = true
+axplat-dyn = { workspace = true, default-features = false }
+rdrive.workspace = true
 spin.workspace = true
 
-[target.'cfg(target_arch = "x86_64")'.dependencies]
-ax-plat-x86-pc = { workspace = true, optional = true }
-
-[target.'cfg(target_os = "none")'.dependencies]
-axplat-dyn = { workspace = true, default-features = false, optional = true }
-
-[target.'cfg(target_arch = "aarch64")'.dependencies]
-ax-plat-aarch64-qemu-virt = { workspace = true, optional = true }
-
-[target.'cfg(target_arch = "riscv64")'.dependencies]
-ax-plat-riscv64-qemu-virt = { workspace = true, optional = true }
-
-[target.'cfg(target_arch = "loongarch64")'.dependencies]
-ax-plat-loongarch64-qemu-virt = { workspace = true, optional = true }
-
 [build-dependencies]
-ax-config.workspace = true
-toml.workspace = true
+quote = "1.0"

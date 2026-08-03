@@ -1,9 +1,30 @@
-//! Process credentials (uid, gid, supplementary groups).
+//! Process credentials and Linux capability state.
+//!
+//! This module keeps the per-thread credential snapshot used by StarryOS
+//! permission checks.  It tracks UID/GID families, supplementary groups, and
+//! the five Linux capability sets exposed through `capget(2)`, `capset(2)`,
+//! `/proc/<pid>/status`, and selected `prctl(2)` operations.
 
 use alloc::sync::Arc;
 
-/// Process credentials tracking real, effective, saved, and filesystem
-/// user/group IDs, plus supplementary groups.
+use linux_raw_sys::general::{
+    CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_FOWNER, CAP_LAST_CAP, CAP_NET_RAW, CAP_SETGID, CAP_SETPCAP,
+    CAP_SETUID, CAP_SYS_ADMIN, CAP_SYS_BOOT, CAP_SYS_MODULE, CAP_SYS_NICE, CAP_SYS_RAWIO,
+    CAP_SYS_RESOURCE,
+};
+
+const CAP_MASK: u64 = (1u64 << (CAP_LAST_CAP + 1)) - 1;
+
+/// Return the bit mask for a single Linux capability number.
+fn cap_bit(cap: u32) -> u64 {
+    if cap <= CAP_LAST_CAP { 1u64 << cap } else { 0 }
+}
+
+/// Process credentials used for identity and permission checks.
+///
+/// The capability fields mirror Linux's inheritable, permitted, effective,
+/// bounding, and ambient sets.  StarryOS stores the currently known capability
+/// range in a `u64`, which is sufficient for `CAP_LAST_CAP`.
 #[derive(Clone, Debug)]
 pub struct Cred {
     /// Real user ID.
@@ -24,10 +45,25 @@ pub struct Cred {
     pub fsgid: u32,
     /// Supplementary group list.
     pub groups: Arc<[u32]>,
+    /// Inheritable Linux capabilities.
+    pub cap_inheritable: u64,
+    /// Permitted Linux capabilities.
+    pub cap_permitted: u64,
+    /// Effective Linux capabilities.
+    pub cap_effective: u64,
+    /// Capability bounding set.
+    pub cap_bounding: u64,
+    /// Ambient Linux capabilities.
+    pub cap_ambient: u64,
 }
 
 impl Cred {
-    /// Create root credentials (all IDs zero, no supplementary groups).
+    /// Return the mask of all Linux capabilities known to this kernel.
+    pub const fn cap_mask() -> u64 {
+        CAP_MASK
+    }
+
+    /// Create root credentials with all permitted/effective capabilities.
     pub fn root() -> Self {
         Self {
             uid: 0,
@@ -39,39 +75,164 @@ impl Cred {
             fsuid: 0,
             fsgid: 0,
             groups: Arc::from([].as_slice()),
+            cap_inheritable: 0,
+            cap_permitted: CAP_MASK,
+            cap_effective: CAP_MASK,
+            cap_bounding: CAP_MASK,
+            cap_ambient: 0,
         }
     }
 
+    /// Create credentials for an unprivileged identity.
+    ///
+    /// The bounding set remains full so future privileged transitions can
+    /// still be represented, but the effective/permitted/ambient sets start
+    /// empty.
+    pub fn unprivileged(uid: u32, gid: u32) -> Self {
+        Self {
+            uid,
+            gid,
+            euid: uid,
+            egid: gid,
+            suid: uid,
+            sgid: gid,
+            fsuid: uid,
+            fsgid: gid,
+            groups: Arc::from([].as_slice()),
+            cap_inheritable: 0,
+            cap_permitted: 0,
+            cap_effective: 0,
+            cap_bounding: CAP_MASK,
+            cap_ambient: 0,
+        }
+    }
+
+    /// Check whether a capability is present in the effective set.
+    pub fn has_cap(&self, cap: u32) -> bool {
+        self.cap_effective & cap_bit(cap) != 0
+    }
+
+    /// Recompute capability state after UID/GID credential changes.
+    ///
+    /// This models the usual Linux setxid transitions: leaving all-root UID
+    /// state drops permitted/effective/ambient caps, losing euid 0 clears the
+    /// effective set, and regaining euid 0 restores effective from permitted.
+    pub fn apply_id_change_capability_rules(&mut self, old: &Self) {
+        let old_all_root = old.uid == 0 && old.euid == 0 && old.suid == 0;
+        let new_all_nonroot = self.uid != 0 && self.euid != 0 && self.suid != 0;
+
+        if old_all_root && new_all_nonroot {
+            self.cap_permitted = 0;
+            self.cap_effective = 0;
+            self.cap_ambient = 0;
+        } else if old.euid == 0 && self.euid != 0 {
+            self.cap_effective = 0;
+            self.cap_ambient = 0;
+        } else if old.euid != 0 && self.euid == 0 {
+            self.cap_effective = self.cap_permitted;
+        }
+
+        self.cap_permitted &= CAP_MASK;
+        self.cap_effective &= self.cap_permitted;
+        self.cap_inheritable &= CAP_MASK;
+        self.cap_bounding &= CAP_MASK;
+        self.cap_ambient &= self.cap_permitted & self.cap_inheritable;
+    }
+
+    /// Limit all capability sets to the kernel-known range and internal
+    /// invariants.
+    pub fn sanitize_capabilities(&mut self) {
+        self.cap_inheritable &= CAP_MASK;
+        self.cap_permitted &= CAP_MASK;
+        self.cap_effective &= self.cap_permitted;
+        self.cap_bounding &= CAP_MASK;
+        self.cap_ambient &= self.cap_permitted & self.cap_inheritable;
+    }
+
     /// Check whether this credential has the privilege to change user IDs
-    /// (equivalent to `CAP_SETUID` — approximated as euid == 0).
+    /// (equivalent to `CAP_SETUID`).
     pub fn has_cap_setuid(&self) -> bool {
-        self.euid == 0
+        self.has_cap(CAP_SETUID)
     }
 
     /// Check whether this credential has the privilege to change group IDs
-    /// (equivalent to `CAP_SETGID` — approximated as euid == 0).
+    /// (equivalent to `CAP_SETGID`).
     pub fn has_cap_setgid(&self) -> bool {
-        self.euid == 0
+        self.has_cap(CAP_SETGID)
     }
 
     /// Check whether this credential may create raw network sockets
-    /// (equivalent to `CAP_NET_RAW` — approximated as euid == 0).
+    /// (equivalent to `CAP_NET_RAW`).
     pub fn has_cap_net_raw(&self) -> bool {
+        self.has_cap(CAP_NET_RAW)
+    }
+
+    /// Check whether this credential may raise scheduling priority
+    /// (equivalent to `CAP_SYS_NICE`).
+    pub fn has_cap_sys_nice(&self) -> bool {
+        self.has_cap(CAP_SYS_NICE)
+    }
+
+    /// Check whether this credential may change process resource limits
+    /// (equivalent to `CAP_SYS_RESOURCE`).
+    pub fn has_cap_sys_resource(&self) -> bool {
+        self.has_cap(CAP_SYS_RESOURCE)
+    }
+
+    /// Check whether this credential may bypass file read/write/execute
+    /// permission checks (equivalent to `CAP_DAC_OVERRIDE`).
+    pub fn has_cap_dac_override(&self) -> bool {
+        self.has_cap(CAP_DAC_OVERRIDE)
+    }
+
+    /// Check whether this credential may perform broad system administration
+    /// operations (equivalent to `CAP_SYS_ADMIN`).
+    pub fn has_cap_sys_admin(&self) -> bool {
+        self.has_cap(CAP_SYS_ADMIN)
+    }
+
+    /// Check whether this credential may reboot the system
+    /// (equivalent to `CAP_SYS_BOOT`).
+    pub fn has_cap_sys_boot(&self) -> bool {
+        self.has_cap(CAP_SYS_BOOT)
+    }
+
+    /// Check whether this credential may perform raw I/O — direct access to
+    /// physical memory / device addresses (equivalent to `CAP_SYS_RAWIO`, the
+    /// capability Linux requires for `/dev/mem`-class access). Gates handing a
+    /// raw physical address to a DMA engine, which can otherwise reach arbitrary
+    /// system memory.
+    pub fn has_cap_sys_rawio(&self) -> bool {
+        self.has_cap(CAP_SYS_RAWIO)
+    }
+
+    /// Check whether this credential may load or unload kernel modules
+    /// (equivalent to `CAP_SYS_MODULE`).
+    pub fn has_cap_sys_module(&self) -> bool {
+        self.has_cap(CAP_SYS_MODULE)
+    }
+
+    /// Check whether this credential may inspect another process
+    /// (equivalent to `CAP_SYS_PTRACE` — approximated as euid == 0).
+    pub fn has_cap_sys_ptrace(&self) -> bool {
         self.euid == 0
     }
 
     /// Check whether this credential has the privilege to change file
-    /// ownership (equivalent to `CAP_CHOWN` — approximated as fsuid == 0,
-    /// since this is a filesystem capability).
+    /// ownership (equivalent to `CAP_CHOWN`).
     pub fn has_cap_chown(&self) -> bool {
-        self.fsuid == 0
+        self.has_cap(CAP_CHOWN)
     }
 
     /// Check whether this credential has the privilege to bypass file
-    /// ownership checks (equivalent to `CAP_FOWNER` — approximated as
-    /// fsuid == 0, since this is a filesystem capability).
+    /// ownership checks (equivalent to `CAP_FOWNER`).
     pub fn has_cap_fowner(&self) -> bool {
-        self.fsuid == 0
+        self.has_cap(CAP_FOWNER)
+    }
+
+    /// Check whether the caller may adjust capability sets.
+    pub fn has_cap_setpcap(&self) -> bool {
+        self.has_cap(CAP_SETPCAP)
     }
 
     /// Return true if `gid` is the process's fsgid or is in its
@@ -86,4 +247,85 @@ impl Default for Cred {
     fn default() -> Self {
         Self::root()
     }
+}
+
+#[cfg(axtest)]
+pub(crate) fn credential_capability_rules_hold_for_test() -> bool {
+    let root = Cred::root();
+    let mut unprivileged = Cred::unprivileged(1000, 100);
+    let old_root = root.clone();
+    let mut dropped = root.clone();
+    dropped.uid = 1000;
+    dropped.euid = 1000;
+    dropped.suid = 1000;
+    dropped.cap_inheritable = Cred::cap_mask();
+    dropped.cap_ambient = Cred::cap_mask();
+    dropped.apply_id_change_capability_rules(&old_root);
+
+    let old_user = Cred::unprivileged(1000, 100);
+    let mut regained_effective = old_user.clone();
+    regained_effective.euid = 0;
+    regained_effective.cap_permitted = cap_bit(CAP_SETUID) | cap_bit(CAP_SETPCAP);
+    regained_effective.apply_id_change_capability_rules(&old_user);
+
+    unprivileged.fsgid = 200;
+    unprivileged.groups = Arc::from([10, 20].as_slice());
+    unprivileged.cap_permitted = cap_bit(CAP_SETUID);
+    unprivileged.cap_effective = cap_bit(CAP_SETUID) | cap_bit(CAP_SETPCAP);
+    unprivileged.cap_inheritable = !0;
+    unprivileged.cap_ambient = !0;
+    unprivileged.sanitize_capabilities();
+
+    // Exercise every has_cap_* helper at least once on a root credential so
+    // the bit checks are covered. All of these must be true for root.
+    let root_capability_helpers = root.has_cap_setuid()
+        && root.has_cap_setgid()
+        && root.has_cap_net_raw()
+        && root.has_cap_sys_nice()
+        && root.has_cap_sys_resource()
+        && root.has_cap_sys_admin()
+        && root.has_cap_sys_boot()
+        && root.has_cap_sys_rawio()
+        && root.has_cap_sys_module()
+        && root.has_cap_chown()
+        && root.has_cap_dac_override()
+        && root.has_cap_fowner()
+        && root.has_cap_setpcap();
+
+    // euid == 0 grants CAP_SYS_PTRACE under the StarryOS approximation.
+    let root_ptrace = root.has_cap_sys_ptrace();
+
+    // Build a credential with only CAP_NET_RAW effective to confirm the
+    // remaining capability helpers report false for non-root.
+    let mut net_raw_only = Cred::unprivileged(1000, 100);
+    net_raw_only.cap_effective = cap_bit(CAP_NET_RAW);
+    let selective_capability_helpers = net_raw_only.has_cap_net_raw()
+        && !net_raw_only.has_cap_setuid()
+        && !net_raw_only.has_cap_setgid()
+        && !net_raw_only.has_cap_sys_admin()
+        && !net_raw_only.has_cap_sys_boot()
+        && !net_raw_only.has_cap_sys_rawio()
+        && !net_raw_only.has_cap_sys_module()
+        && !net_raw_only.has_cap_sys_nice()
+        && !net_raw_only.has_cap_sys_resource()
+        && !net_raw_only.has_cap_chown()
+        && !net_raw_only.has_cap_dac_override()
+        && !net_raw_only.has_cap_fowner()
+        && !net_raw_only.has_cap_setpcap()
+        && !net_raw_only.has_cap_sys_ptrace();
+
+    // The original root/unprivileged rules must still hold.
+    root_capability_helpers
+        && root_ptrace
+        && !Cred::unprivileged(1000, 100).has_cap_setuid()
+        && selective_capability_helpers
+        && dropped.cap_permitted == 0
+        && dropped.cap_effective == 0
+        && dropped.cap_ambient == 0
+        && regained_effective.cap_effective == regained_effective.cap_permitted
+        && unprivileged.cap_effective == cap_bit(CAP_SETUID)
+        && unprivileged.cap_ambient == unprivileged.cap_permitted & unprivileged.cap_inheritable
+        && unprivileged.in_group(200)
+        && unprivileged.in_group(10)
+        && !unprivileged.in_group(30)
 }

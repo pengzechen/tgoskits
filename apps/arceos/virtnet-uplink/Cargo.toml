@@ -1,0 +1,18 @@
+[package]
+name = "arceos-virtnet-uplink"
+version = "0.1.0"
+edition.workspace = true
+authors = ["AxVisor virtio-net uplink test"]
+publish = false
+
+[features]
+default = ["arceos"]
+arceos = ["dep:ax-std", "ax-std/arceos", "ax-std/net", "ax-std/dns"]
+el1-phys-timer = ["ax-std/el1-phys-timer"]
+
+[dependencies]
+ax-std = { workspace = true, optional = true, features = ["default"] }
+ax-net = { workspace = true }
+
+[package.metadata.axstd]
+features = ["log-level-info"]

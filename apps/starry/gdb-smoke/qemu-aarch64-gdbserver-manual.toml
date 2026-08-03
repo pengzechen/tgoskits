@@ -1,0 +1,25 @@
+args = [
+    "-nographic",
+    "-m",
+    "512M",
+    "-cpu",
+    "cortex-a53",
+    "-device",
+    "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
+    "-drive",
+    "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-aarch64-alpine.img",
+    "-device",
+    "virtio-net-pci,netdev=net0",
+    "-netdev",
+    "user,id=net0,hostfwd=tcp::1234-:1234",
+]
+uefi = false
+to_bin = true
+shell_prefix = "root@starry:"
+success_regex = []
+fail_regex = [
+    '(?i)\bpanic(?:ked)?\b',
+    '(?m)FAIL',
+    'gdbserver: not found',
+]
+timeout = 0

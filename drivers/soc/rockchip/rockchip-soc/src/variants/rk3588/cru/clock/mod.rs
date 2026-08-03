@@ -211,6 +211,10 @@ clk_id_group!(
 clk_id_group!(
     HCLK_SDIO = 409,
     CCLK_SRC_SDIO = 410,
+    SCLK_SDIO_DRV = 704,
+    SCLK_SDIO_SAMPLE = 705,
+    SCLK_SDMMC_DRV = 706,
+    SCLK_SDMMC_SAMPLE = 707,
     HCLK_EMMC = 312,
     ACLK_EMMC = 313,
     CCLK_EMMC = 314,
@@ -219,6 +223,8 @@ clk_id_group!(
     SCLK_SFC = 317,
     HCLK_SFC = 318,
     HCLK_SFC_XIP = 319,
+    HCLK_NVM_ROOT = 320,
+    ACLK_NVM_ROOT = 321,
 );
 
 // =============================================================================
@@ -251,6 +257,15 @@ clk_id_group!(
 );
 
 // =============================================================================
+// RGA 时钟 ID
+// =============================================================================
+
+// RGA2 bus clocks (gate positions in CLKGATE_CON45, see gate.rs). PR-1 brings up RGA2 only;
+// the RGA3 core clock ids (ACLK_RGA3_0=442/HCLK_RGA3_0=441/CLK_RGA3_0_CORE=443,
+// ACLK_RGA3_1=394/HCLK_RGA3_1=393/CLK_RGA3_1_CORE=395) are deferred with the RGA3 bring-up.
+clk_id_group!(HCLK_RGA2 = 438, ACLK_RGA2 = 439, CLK_RGA2_CORE = 440,);
+
+// =============================================================================
 // GMAC 时钟 ID
 // =============================================================================
 
@@ -262,16 +277,70 @@ clk_id_group!(
 );
 
 // =============================================================================
+// PCIe/PHP 时钟 ID
+// =============================================================================
+
+clk_id_group!(
+    ACLK_PHP_GIC_ITS = 326,
+    ACLK_MMU_PCIE = 327,
+    ACLK_MMU_PHP = 328,
+    ACLK_PCIE_4L_DBI = 329,
+    ACLK_PCIE_2L_DBI = 330,
+    ACLK_PCIE_1L0_DBI = 331,
+    ACLK_PCIE_1L1_DBI = 332,
+    ACLK_PCIE_1L2_DBI = 333,
+    ACLK_PCIE_4L_MSTR = 334,
+    ACLK_PCIE_2L_MSTR = 335,
+    ACLK_PCIE_1L0_MSTR = 336,
+    ACLK_PCIE_1L1_MSTR = 337,
+    ACLK_PCIE_1L2_MSTR = 338,
+    ACLK_PCIE_4L_SLV = 339,
+    ACLK_PCIE_2L_SLV = 340,
+    ACLK_PCIE_1L0_SLV = 341,
+    ACLK_PCIE_1L1_SLV = 342,
+    ACLK_PCIE_1L2_SLV = 343,
+    PCLK_PCIE_4L = 344,
+    PCLK_PCIE_2L = 345,
+    PCLK_PCIE_1L0 = 347,
+    PCLK_PCIE_1L1 = 348,
+    PCLK_PCIE_1L2 = 349,
+    CLK_PCIE_AUX0 = 350,
+    CLK_PCIE_AUX1 = 351,
+    CLK_PCIE_AUX2 = 352,
+    CLK_PCIE_AUX3 = 353,
+    CLK_PCIE_AUX4 = 354,
+    CLK_PIPEPHY0_REF = 355,
+    CLK_PIPEPHY1_REF = 356,
+    CLK_PIPEPHY2_REF = 357,
+    PCLK_PHP_ROOT = 358,
+    ACLK_PCIE_ROOT = 361,
+    ACLK_PHP_ROOT = 362,
+    ACLK_PCIE_BRIDGE = 363,
+);
+
+// =============================================================================
 // USB 时钟 ID
 // =============================================================================
 
 clk_id_group!(
-    PCLK_PHP_USBHOST3_0 = 358,
     ACLK_USB3OTG2 = 375,
     SUSPEND_CLK_USB3OTG2 = 376,
     REF_CLK_USB3OTG2 = 377,
     CLK_UTMI_OTG2 = 378,
-    CLK_PIPE_USBHOST3_0 = 385,
+    CLK_PIPEPHY0_PIPE_G = 379,
+    CLK_PIPEPHY1_PIPE_G = 380,
+    CLK_PIPEPHY2_PIPE_G = 381,
+    CLK_PIPEPHY0_PIPE_ASIC_G = 382,
+    CLK_PIPEPHY1_PIPE_ASIC_G = 383,
+    CLK_PIPEPHY2_PIPE_ASIC_G = 384,
+    CLK_PIPEPHY2_PIPE_U3_G = 385,
+    CLK_PCIE1L2_PIPE = 386,
+    CLK_PCIE4L_PIPE = 387,
+    CLK_PCIE2L_PIPE = 388,
+    PCLK_PCIE_COMBO_PIPE_PHY0 = 389,
+    PCLK_PCIE_COMBO_PIPE_PHY1 = 390,
+    PCLK_PCIE_COMBO_PIPE_PHY2 = 391,
+    PCLK_PCIE_COMBO_PIPE_PHY = 392,
 );
 
 clk_id_group!(
@@ -300,9 +369,34 @@ clk_id_group!(
     USBDP_PHY1_IMMORTAL = 640,
 );
 
-clk_id_group!(CLK_USBPHY_480M = 693,);
-clk_id_group!(USBDPPHY_MIPIDCPPHY_REF = 694,);
+clk_id_group!(
+    CLK_USB2PHY_HDPTXRXPHY_REF = 693,
+    CLK_USBDPPHY_MIPIDCPPHY_REF = 694,
+    CLK_REF_PIPE_PHY0_OSC_SRC = 695,
+    CLK_REF_PIPE_PHY1_OSC_SRC = 696,
+    CLK_REF_PIPE_PHY2_OSC_SRC = 697,
+    CLK_REF_PIPE_PHY0_PLL_SRC = 698,
+    CLK_REF_PIPE_PHY1_PLL_SRC = 699,
+    CLK_REF_PIPE_PHY2_PLL_SRC = 700,
+    CLK_REF_PIPE_PHY0 = 701,
+    CLK_REF_PIPE_PHY1 = 702,
+    CLK_REF_PIPE_PHY2 = 703,
+);
+clk_id_group!(CLK_PCIE1L0_PIPE = 708, CLK_PCIE1L1_PIPE = 709,);
 
+// =============================================================================
+// JPEG 解码器 (VDPU) 时钟 ID
+//
+// 注意：436/437 是本 crate 内部使用的合成 ClkId（仅作为 gate 表的查找键），并非
+// RK3588 设备树绑定编号。规范的 ACLK/HCLK_JPEG_DECODER = 421/422 在本文件中已被
+// 既有的 USB3OTG1 条目占用（SUSPEND_CLK_USB3OTG1=421, REF_CLK_USB3OTG1=422），
+// 故改用未占用的 436/437 作键。实际硬件门控由 gate.rs 中经核对的
+// CLKGATE_CON(45) bit 2/3 选择，与此键值无关。
+// =============================================================================
+clk_id_group!(ACLK_JPEG_DECODER = 436, HCLK_JPEG_DECODER = 437,);
+
+pub const PCLK_PHP_USBHOST3_0: ClkId = PCLK_PHP_ROOT;
+pub const CLK_PIPE_USBHOST3_0: ClkId = CLK_PIPEPHY2_PIPE_U3_G;
 pub const CLK_REF_USB3OTG0: ClkId = REF_CLK_USB3OTG0;
 pub const CLK_SUSPEND_USB3OTG0: ClkId = SUSPEND_CLK_USB3OTG0;
 pub const CLK_REF_USB3OTG1: ClkId = REF_CLK_USB3OTG1;
@@ -358,8 +452,25 @@ pub fn is_adc_clk(clk_id: ClkId) -> bool {
 
 /// 判断时钟 ID 是否为 MMC/EMMC/SDIO/SFC
 pub fn is_mmc_clk(clk_id: ClkId) -> bool {
-    // CCLK_EMMC, BCLK_EMMC, CCLK_SRC_SDIO, SCLK_SFC
-    matches!(clk_id, CCLK_EMMC | BCLK_EMMC | CCLK_SRC_SDIO | SCLK_SFC)
+    matches!(
+        clk_id,
+        HCLK_SDIO
+            | HCLK_EMMC
+            | ACLK_EMMC
+            | CCLK_EMMC
+            | BCLK_EMMC
+            | TMCLK_EMMC
+            | SCLK_SFC
+            | HCLK_SFC
+            | HCLK_SFC_XIP
+            | HCLK_NVM_ROOT
+            | ACLK_NVM_ROOT
+            | CCLK_SRC_SDIO
+            | SCLK_SDIO_DRV
+            | SCLK_SDIO_SAMPLE
+            | SCLK_SDMMC_DRV
+            | SCLK_SDMMC_SAMPLE
+    )
 }
 
 /// 判断时钟 ID 是否为 NPU
@@ -370,7 +481,8 @@ pub fn is_npu_clk(clk_id: ClkId) -> bool {
 /// 判断时钟 ID 是否为 USB
 ///
 /// USB 时钟包括：
-/// - 可配置频率时钟：ACLK_USB_ROOT, HCLK_USB_ROOT, CLK_UTMI_OTG2, PCLK_PHP_USBHOST3_0, ACLK_USB, HCLK_USB
+/// - 可配置频率时钟：ACLK_USB_ROOT, HCLK_USB_ROOT, CLK_UTMI_OTG2,
+///   PCLK_PHP_USBHOST3_0, ACLK_USB, HCLK_USB
 /// - 固定频率门控时钟：其他所有 USB 时钟
 pub fn is_usb_clk(clk_id: ClkId) -> bool {
     // 可配置频率时钟
@@ -380,7 +492,8 @@ pub fn is_usb_clk(clk_id: ClkId) -> bool {
             | HCLK_USB_ROOT
             | CLK_UTMI_OTG2
             | PCLK_PHP_USBHOST3_0
-            | CLK_USBPHY_480M
+            | CLK_USB2PHY_HDPTXRXPHY_REF
+            | CLK_USBDPPHY_MIPIDCPPHY_REF
             | ACLK_USB
             | HCLK_USB
     );
@@ -406,10 +519,77 @@ pub fn is_usb_clk(clk_id: ClkId) -> bool {
             | PCLK_USBDPPHY1
             | USBDP_PHY0_IMMORTAL
             | USBDP_PHY1_IMMORTAL
-            | USBDPPHY_MIPIDCPPHY_REF
     );
 
     configurable || gates
+}
+
+/// 判断时钟 ID 是否为 PCIe/PHP 相关时钟
+pub fn is_pcie_clk(clk_id: ClkId) -> bool {
+    let gates = matches!(
+        clk_id,
+        ACLK_PHP_GIC_ITS
+            | ACLK_MMU_PCIE
+            | ACLK_MMU_PHP
+            | ACLK_PCIE_4L_DBI
+            | ACLK_PCIE_2L_DBI
+            | ACLK_PCIE_1L0_DBI
+            | ACLK_PCIE_1L1_DBI
+            | ACLK_PCIE_1L2_DBI
+            | ACLK_PCIE_4L_MSTR
+            | ACLK_PCIE_2L_MSTR
+            | ACLK_PCIE_1L0_MSTR
+            | ACLK_PCIE_1L1_MSTR
+            | ACLK_PCIE_1L2_MSTR
+            | ACLK_PCIE_4L_SLV
+            | ACLK_PCIE_2L_SLV
+            | ACLK_PCIE_1L0_SLV
+            | ACLK_PCIE_1L1_SLV
+            | ACLK_PCIE_1L2_SLV
+            | PCLK_PCIE_4L
+            | PCLK_PCIE_2L
+            | PCLK_PCIE_1L0
+            | PCLK_PCIE_1L1
+            | PCLK_PCIE_1L2
+            | CLK_PCIE_AUX0
+            | CLK_PCIE_AUX1
+            | CLK_PCIE_AUX2
+            | CLK_PCIE_AUX3
+            | CLK_PCIE_AUX4
+            | CLK_PIPEPHY0_REF
+            | CLK_PIPEPHY1_REF
+            | CLK_PIPEPHY2_REF
+            | PCLK_PHP_ROOT
+            | ACLK_PCIE_ROOT
+            | ACLK_PHP_ROOT
+            | ACLK_PCIE_BRIDGE
+            | CLK_PCIE4L_PIPE
+            | CLK_PCIE2L_PIPE
+            | CLK_PIPEPHY0_PIPE_G
+            | CLK_PIPEPHY1_PIPE_G
+            | CLK_PIPEPHY2_PIPE_G
+            | CLK_PIPEPHY0_PIPE_ASIC_G
+            | CLK_PIPEPHY1_PIPE_ASIC_G
+            | CLK_PIPEPHY2_PIPE_ASIC_G
+            | CLK_PCIE1L2_PIPE
+            | CLK_PCIE1L0_PIPE
+            | CLK_PCIE1L1_PIPE
+            | PCLK_PCIE_COMBO_PIPE_PHY0
+            | PCLK_PCIE_COMBO_PIPE_PHY1
+            | PCLK_PCIE_COMBO_PIPE_PHY2
+            | PCLK_PCIE_COMBO_PIPE_PHY
+            | CLK_REF_PIPE_PHY0_OSC_SRC
+            | CLK_REF_PIPE_PHY1_OSC_SRC
+            | CLK_REF_PIPE_PHY2_OSC_SRC
+            | CLK_REF_PIPE_PHY0_PLL_SRC
+            | CLK_REF_PIPE_PHY1_PLL_SRC
+            | CLK_REF_PIPE_PHY2_PLL_SRC
+            | CLK_REF_PIPE_PHY0
+            | CLK_REF_PIPE_PHY1
+            | CLK_REF_PIPE_PHY2
+    );
+
+    gates
 }
 
 /// 获取 I2C 编号 (0-8)

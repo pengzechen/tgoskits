@@ -2,7 +2,8 @@ mod fs;
 mod inode;
 mod util;
 
-use ax_driver::{AxBlockDevice, PartitionBlockDevice, PartitionRegion, prelude::BlockDriverOps};
+use alloc::boxed::Box;
+
 pub use fs::*;
 pub use inode::*;
 use rsext4::{
@@ -13,11 +14,13 @@ use rsext4::{
     error::{Ext4Error, Ext4Result},
 };
 
-pub(crate) struct Ext4Disk(PartitionBlockDevice<AxBlockDevice>);
+use crate::block::{BlockRegion, FsBlockDevice, RegionBlockDevice};
+
+pub(crate) struct Ext4Disk(RegionBlockDevice<Box<dyn FsBlockDevice>>);
 
 impl Ext4Disk {
-    pub(crate) const fn new(dev: AxBlockDevice, region: PartitionRegion) -> Self {
-        Self(PartitionBlockDevice::new(dev, region))
+    pub fn new(dev: Box<dyn FsBlockDevice>, region: BlockRegion) -> Self {
+        Self(RegionBlockDevice::new(dev, region))
     }
 }
 
@@ -77,11 +80,7 @@ impl BlockDevice for Ext4Disk {
     }
 
     fn current_time(&self) -> Ext4Result<Ext4Timestamp> {
-        if cfg!(feature = "times") {
-            let dur = ax_hal::time::wall_time();
-            Ok(Ext4Timestamp::new(dur.as_secs() as i64, dur.subsec_nanos()))
-        } else {
-            Ok(Ext4Timestamp::new(0, 0))
-        }
+        let dur = crate::os::wall_time();
+        Ok(Ext4Timestamp::new(dur.as_secs() as i64, dur.subsec_nanos()))
     }
 }

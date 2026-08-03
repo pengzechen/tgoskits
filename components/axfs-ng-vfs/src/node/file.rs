@@ -1,12 +1,10 @@
 use alloc::sync::Arc;
 use core::ops::Deref;
 
-use axpoll::Pollable;
-
 use super::NodeOps;
-use crate::{VfsError, VfsResult};
+use crate::{FsPollable, VfsError, VfsResult};
 
-pub trait FileNodeOps: NodeOps + Pollable {
+pub trait FileNodeOps: NodeOps + FsPollable {
     /// Reads a number of bytes starting from a given offset.
     fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize>;
 
@@ -29,14 +27,9 @@ pub trait FileNodeOps: NodeOps + Pollable {
     fn ioctl(&self, _cmd: u32, _arg: usize) -> VfsResult<usize> {
         Err(VfsError::NotATty)
     }
-
-    /// A hint to the backend that the file position has changed.
-    /// This is used for operations like resetting file content in proc/sys.
-    fn seek_to(&self, _pos: u64) -> VfsResult<()> {
-        Ok(())
-    }
 }
 
+#[derive(Clone)]
 #[repr(transparent)]
 pub struct FileNode(Arc<dyn FileNodeOps>);
 

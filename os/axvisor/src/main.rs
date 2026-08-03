@@ -14,11 +14,12 @@
 
 //! # Axvisor Kernel
 //!
-//! The main kernel binary for the Axvisor hypervisor.
-
-#![no_std]
-#![no_main]
-#![cfg(target_os = "none")]
+//! Kernel entry point for the Axvisor hypervisor.
+//!
+//! This module wires together early boot presentation, hardware virtualization
+//! enablement, VM initialization/startup, and the interactive management shell.
+//! The implementation is intentionally small so that the boot order is visible
+//! from a single file.
 
 #[macro_use]
 extern crate log;
@@ -26,45 +27,56 @@ extern crate log;
 #[macro_use]
 extern crate alloc;
 
-extern crate ax_std as std;
+use ax_std as _;
 
-#[cfg(target_arch = "loongarch64")]
-extern crate ax_plat_loongarch64_qemu_virt;
-#[cfg(target_arch = "x86_64")]
-extern crate axplat_x86_qemu_q35;
-
-mod hal;
-mod logo;
+mod banner;
+mod config;
+mod manager;
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+mod platform_irq;
 mod shell;
-mod task;
-mod vmm;
+mod virtio_net;
 
-fn ensure_hardware_support() {
-    if axvm::has_hardware_support() {
-        return;
-    }
-
-    #[cfg(target_arch = "loongarch64")]
-    panic!(
-        "LoongArch virtualization extensions are unavailable. Use a virtualization-capable \
-         LoongArch QEMU build such as QEMU-LVZ instead of stock qemu-system-loongarch64."
-    );
-
-    #[cfg(not(target_arch = "loongarch64"))]
-    panic!("Hardware does not support virtualization");
+#[cfg(any(feature = "backtrace", feature = "test-panic-no-backtrace"))]
+fn init_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("{info}");
+        // When the `backtrace` feature is NOT enabled, axbacktrace is compiled
+        // without `alloc` → Inner::Disabled → BT_ERROR requires_alloc.
+        // When the `backtrace` feature IS enabled, axbacktrace captures real
+        // frames (alloc=true, frames enumerated).
+        eprintln!("{}", axbacktrace::Backtrace::capture().kind("panic"));
+    }));
 }
 
-#[unsafe(no_mangle)]
+/// Axvisor kernel entry point.
+///
+/// The startup sequence is:
+///
+/// 1. Print the startup banner.
+/// 2. Check and enable hardware virtualization on every CPU.
+/// 3. Build and start configured guest VMs.
+/// 4. Enter the management shell after the default guests have exited.
 fn main() {
-    logo::print_logo();
+    #[cfg(any(feature = "backtrace", feature = "test-panic-no-backtrace"))]
+    init_panic_hook();
+
+    // Test-only panic paths — gated behind dedicated features so they never
+    // activate in normal builds.  These are consumed by test-suit cases that
+    // verify the backtrace markers (or their absence) via QEMU regex matching.
+    #[cfg(feature = "test-backtrace-panic")]
+    panic!("axvisor backtrace smoke test: deliberate panic to verify backtrace output");
+    #[cfg(feature = "test-panic-no-backtrace")]
+    panic!("axvisor no-backtrace smoke test: panic without backtrace");
+
+    banner::print_logo();
 
     info!("Starting virtualization...");
-    info!("Hardware support: {:?}", axvm::has_hardware_support());
-    ensure_hardware_support();
-    hal::enable_virtualization();
+    let manager = manager::AxvmManager::new()
+        .unwrap_or_else(|error| panic!("failed to initialize AxVM manager: {error:#}"));
 
-    vmm::init();
-    vmm::start();
+    manager.init_default_vms();
+    manager.start_default_vms();
 
     info!("[OK] Default guest initialized");
 

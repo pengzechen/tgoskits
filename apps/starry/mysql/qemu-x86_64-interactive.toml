@@ -1,0 +1,27 @@
+timeout = 0
+shell_prefix = "root@starry:"
+uefi = false
+to_bin = false
+success_regex = []
+fail_regex = []
+
+args = [
+    "-machine",
+    "q35",
+    "-nographic",
+    "-m",
+    "2G",
+    "-device",
+    "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
+    "-drive",
+    "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-mysql.img",
+    "-device",
+    "virtio-net-pci,netdev=net0",
+    "-netdev",
+    "user,id=net0",
+    "-append",
+    "root=/dev/nvme0n1",
+    "-snapshot",
+]
+
+shell_init_cmd = "/usr/bin/mysql-interactive.sh"

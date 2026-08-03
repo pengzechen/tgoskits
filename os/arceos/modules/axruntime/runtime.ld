@@ -1,0 +1,48 @@
+INCLUDE "axplat.x"
+
+SECTIONS {
+    .init_array : AT(ADDR(.init_array) - AX_LINKER_LOAD_OFFSET) ALIGN(0x10) {
+        __init_array_start = .;
+        KEEP(*(.init_array .init_array.*))
+        __init_array_end = .;
+    }
+
+    .runtime : AT(ADDR(.runtime) - AX_LINKER_LOAD_OFFSET) ALIGN(0x10) {
+        __sdriver_register = .;
+        KEEP(*(.driver.register*))
+        __edriver_register = .;
+
+        . = ALIGN(0x10);
+        _ex_table_start = .;
+        KEEP(*(__ex_table))
+        _ex_table_end = .;
+
+        . = ALIGN(0x10);
+        __axtest_array = .;
+        KEEP(*(SORT(.axtest_array)))
+        __axtest_array_end = .;
+
+        . = ALIGN(0x10);
+        __axtest_mod_hooks_start = .;
+        KEEP(*(SORT(.axtest_mod_hooks)))
+        __axtest_mod_hooks_end = .;
+
+%AXTEST_COVERAGE_RUNTIME_SECTIONS%
+    }
+
+%AXTEST_COVERAGE_OUTPUT_SECTIONS%
+
+    scope_local : AT(ADDR(scope_local) - AX_LINKER_LOAD_OFFSET) {
+        KEEP(*(scope_local))
+    }
+
+    %DWARF%
+}
+INSERT AFTER .rodata;
+
+PROVIDE(_sbss = __bss_start);
+PROVIDE(_ebss = __bss_stop);
+PROVIDE(boot_stack = __cpu0_stack);
+PROVIDE(boot_stack_top = __cpu0_stack_top);
+PROVIDE(_skernel = VM_LOAD_ADDRESS);
+PROVIDE(_ekernel = __kernel_code_end);

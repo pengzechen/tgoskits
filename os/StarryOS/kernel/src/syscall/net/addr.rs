@@ -9,11 +9,60 @@ use core::{
 
 use ax_errno::{AxError, AxResult, LinuxError};
 #[cfg(feature = "vsock")]
-use axnet::vsock::VsockAddr;
-use axnet::{SocketAddrEx, unix::UnixSocketAddr};
-use linux_raw_sys::net::*;
+use ax_net::vsock::VsockAddr;
+use ax_net::{SocketAddrEx, unix::UnixSocketAddr};
+use linux_raw_sys::{net::*, netlink::sockaddr_nl};
 
 use crate::mm::{UserConstPtr, UserPtr};
+
+pub fn normalize_socket_addr_ex_for_ip_stack(
+    addr: SocketAddrEx,
+    is_bind: bool,
+) -> AxResult<SocketAddrEx> {
+    match addr {
+        SocketAddrEx::Ip(SocketAddr::V4(_)) => Ok(addr),
+        SocketAddrEx::Ip(SocketAddr::V6(v6)) => {
+            let ip = *v6.ip();
+            let v4 = if let Some(v4) = ip.to_ipv4_mapped() {
+                v4
+            } else if ip.is_unspecified() {
+                if !is_bind {
+                    return Err(AxError::from(LinuxError::EINVAL));
+                }
+                Ipv4Addr::UNSPECIFIED
+            } else if ip == Ipv6Addr::LOCALHOST {
+                Ipv4Addr::LOCALHOST
+            } else if is_bind {
+                return Err(AxError::from(LinuxError::EADDRNOTAVAIL));
+            } else {
+                return Err(AxError::from(LinuxError::ENETUNREACH));
+            };
+            Ok(SocketAddrEx::Ip(SocketAddr::V4(SocketAddrV4::new(
+                v4,
+                v6.port(),
+            ))))
+        }
+        SocketAddrEx::Unix(_) => Ok(addr),
+        #[cfg(feature = "vsock")]
+        SocketAddrEx::Vsock(_) => Ok(addr),
+    }
+}
+
+pub fn socket_addr_ex_for_user_name(domain: u32, addr: SocketAddrEx) -> SocketAddrEx {
+    if domain != AF_INET6 {
+        return addr;
+    }
+    match addr {
+        SocketAddrEx::Ip(SocketAddr::V4(v4)) => {
+            SocketAddrEx::Ip(SocketAddr::V6(socket_addr_v4_to_mapped_v6(&v4)))
+        }
+        _ => addr,
+    }
+}
+
+pub fn socket_addr_v4_to_mapped_v6(v4: &SocketAddrV4) -> SocketAddrV6 {
+    SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0)
+}
 
 /// Trait to extend [`SocketAddr`] and its variants with methods for reading
 /// from and writing to user space.
@@ -48,6 +97,32 @@ fn fill_addr(addr: UserPtr<sockaddr>, addrlen: &mut socklen_t, data: &[u8]) -> A
         .copy_from_slice(&data[..len]);
     *addrlen = data.len() as _;
     Ok(())
+}
+
+pub fn read_netlink_addr(
+    addr: UserConstPtr<sockaddr>,
+    addrlen: socklen_t,
+) -> AxResult<sockaddr_nl> {
+    // Linux `netlink_bind`/`netlink_connect` reject only `addrlen < sizeof(sockaddr_nl)`;
+    // a larger length is accepted and the trailing bytes ignored. Callers commonly zero a
+    // `sockaddr_storage` and pass its full size, so requiring an exact match wrongly
+    // returned EINVAL for legitimate binds/connects. Read just the leading sockaddr_nl.
+    if (addrlen as usize) < size_of::<sockaddr_nl>() {
+        return Err(AxError::InvalidInput);
+    }
+    let addr_nl = addr.cast::<sockaddr_nl>().get_as_ref()?;
+    if addr_nl.nl_family as u32 != AF_NETLINK {
+        return Err(AxError::from(LinuxError::EAFNOSUPPORT));
+    }
+    Ok(*addr_nl)
+}
+
+pub fn write_netlink_addr(
+    addr_nl: &sockaddr_nl,
+    addr: UserPtr<sockaddr>,
+    addrlen: &mut socklen_t,
+) -> AxResult<()> {
+    fill_addr(addr, addrlen, unsafe { cast_to_slice(addr_nl) })
 }
 
 impl SocketAddrExt for SocketAddr {
@@ -174,7 +249,10 @@ impl SocketAddrExt for UnixSocketAddr {
             UnixSocketAddr::Path(path) => 1 + path.len(),
         };
         let mut buf = Vec::with_capacity(size_of::<__kernel_sa_family_t>() + data_len);
-        buf.extend_from_slice(&AF_UNIX.to_ne_bytes());
+        // sun_family is sa_family_t (2 bytes). `AF_UNIX` from linux_raw_sys is a
+        // u32; writing it raw would emit a 4-byte family, over-reporting addrlen
+        // by 2 and shifting sun_path against the 2-byte offset the read path uses.
+        buf.extend_from_slice(&(AF_UNIX as __kernel_sa_family_t).to_ne_bytes());
         match self {
             UnixSocketAddr::Unnamed => {}
             UnixSocketAddr::Abstract(name) => {
@@ -263,6 +341,30 @@ impl SocketAddrExt for SocketAddrEx {
     }
 
     fn family(&self) -> u16 {
-        AF_INET as u16
+        match self {
+            SocketAddrEx::Ip(ip) => ip.family(),
+            SocketAddrEx::Unix(unix) => unix.family(),
+            #[cfg(feature = "vsock")]
+            SocketAddrEx::Vsock(vsock) => vsock.family(),
+        }
     }
+}
+
+#[cfg(axtest)]
+pub(crate) fn net_addr_conversion_rules_hold_for_test() -> bool {
+    use core::net::{Ipv4Addr, SocketAddrV4};
+
+    // Test socket_addr_v4_to_mapped_v6 conversion
+    let v4 = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 8080);
+    let v6 = socket_addr_v4_to_mapped_v6(&v4);
+
+    // Check port preservation
+    assert!(v6.port() == 8080);
+
+    // Test localhost mapping
+    let localhost_v4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80);
+    let localhost_v6 = socket_addr_v4_to_mapped_v6(&localhost_v4);
+    assert!(localhost_v6.port() == 80);
+
+    true
 }

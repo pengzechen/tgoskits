@@ -19,7 +19,6 @@
 //!
 //! # Cargo Features
 //!
-//! - `alloc`: Enable global memory allocator.
 //! - `paging`: Enable page table manipulation support.
 //! - `irq`: Enable interrupt handling support.
 //! - `multitask`: Enable multi-threading support.
@@ -30,23 +29,65 @@
 //!
 //! All the features are optional and disabled by default.
 
+#![feature(extern_item_impls)]
 #![cfg_attr(not(test), no_std)]
 #![allow(missing_abi)]
 
 #[macro_use]
 extern crate ax_log;
 
-#[cfg(all(target_os = "none", not(test)))]
+extern crate ax_driver as _;
+
+#[cfg(all(target_os = "none", not(feature = "std-compat"), not(test)))]
 mod lang_items;
+#[cfg(all(
+    feature = "stack-protector",
+    any(target_os = "none", target_env = "musl"),
+    not(test)
+))]
+mod stack_protector;
 
 #[cfg(feature = "smp")]
 mod mp;
 
 #[cfg(feature = "paging")]
+mod kernel_mapping;
 mod klib;
+
+mod devices;
+mod fs;
+#[cfg(feature = "irq")]
+pub mod irq;
+mod registers;
+#[cfg(feature = "serial")]
+pub mod serial;
+
+#[cfg(all(feature = "net", feature = "fs"))]
+mod unix_ns;
+
+#[cfg(feature = "aic8800-wifi")]
+mod wifi_glue;
+
+pub use ax_hal as hal;
+
+pub(crate) mod build_info {
+    include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
+}
 
 #[cfg(feature = "smp")]
 pub use self::mp::rust_main_secondary;
+
+extern crate alloc;
+
+#[cfg(feature = "fs")]
+pub(crate) fn runtime_default_task_stack_size() -> usize {
+    build_info::TASK_STACK_SIZE
+}
+
+#[cfg(feature = "irq")]
+fn ticks_per_sec() -> u64 {
+    build_info::TICKS_PER_SEC as u64
+}
 
 const LOGO: &str = r#"
        d8888                            .d88888b.   .d8888b.
@@ -59,16 +100,40 @@ const LOGO: &str = r#"
 d88P     888 888      "Y8888P  "Y8888   "Y88888P"   "Y8888P"
 "#;
 
-unsafe extern "C" {
-    /// Application's entry point.
-    fn main();
+#[eii]
+fn ax_app_entry() {
+    #[cfg(not(test))]
+    unsafe extern "C" {
+        /// Legacy application's entry point.
+        safe fn main();
+    }
+    // Default implementation
+    #[cfg(not(test))]
+    main();
 }
 
 struct LogIfImpl;
 
+#[cfg(feature = "paging")]
+fn runtime_page_fault_handler(
+    addr: ax_memory_addr::VirtAddr,
+    flags: ax_hal::trap::PageFaultFlags,
+) -> bool {
+    #[cfg(feature = "stack-guard-page")]
+    if ax_task::diagnose_current_stack_guard_page_fault(addr) {
+        return false;
+    }
+
+    ax_mm::kernel_aspace().lock().handle_page_fault(addr, flags)
+}
+
 #[ax_crate_interface::impl_interface]
 impl ax_log::LogIf for LogIfImpl {
     fn console_write_str(s: &str) {
+        #[cfg(feature = "serial")]
+        if serial::route_console_bytes(s.as_bytes()).is_some() {
+            return;
+        }
         ax_hal::console::write_text_bytes(s.as_bytes());
     }
 
@@ -122,12 +187,9 @@ fn is_init_ok() -> bool {
 /// secondary cores call [`rust_main_secondary`].
 #[cfg_attr(not(test), ax_plat::main)]
 pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
-    #[cfg(not(feature = "plat-dyn"))]
-    unsafe {
-        ax_hal::mem::clear_bss()
-    };
     ax_hal::percpu::init_primary(cpu_id);
-    #[cfg(all(feature = "alloc", feature = "buddy-slab"))]
+    // After per-CPU init, before scheduler/IPI/IRQ paths can allocate.
+    // This is a no-op for allocator backends that do not need per-CPU state.
     ax_alloc::init_percpu_slab(cpu_id);
     ax_hal::init_early(cpu_id, arg);
     let log_level = option_env!("AX_LOG").unwrap_or("info");
@@ -143,19 +205,13 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
             backtrace = {}
             smp = {}
         "},
-        ax_config::ARCH,
-        ax_config::PLATFORM,
-        option_env!("AX_TARGET").unwrap_or(""),
-        option_env!("AX_MODE").unwrap_or(""),
+        build_info::ARCH,
+        hal::platform_name(),
+        build_info::TARGET,
+        build_info::MODE,
         log_level,
         axbacktrace::is_enabled(),
         ax_hal::cpu_num()
-    );
-
-    #[cfg(feature = "rtc")]
-    ax_println!(
-        "Boot at {}\n",
-        chrono::DateTime::from_timestamp_nanos(ax_hal::time::wall_time_nanos() as _),
     );
 
     ax_log::init();
@@ -174,8 +230,9 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
         );
     }
 
-    #[cfg(feature = "alloc")]
     init_allocator();
+
+    let (kernel_space_start, kernel_space_size) = ax_hal::mem::kernel_aspace();
 
     {
         use core::ops::Range;
@@ -183,22 +240,21 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
         unsafe extern "C" {
             safe static _stext: [u8; 0];
             safe static _etext: [u8; 0];
-            safe static _edata: [u8; 0];
         }
 
+        let fp_range_start = kernel_space_start.as_usize();
+        let fp_range_end = fp_range_start.saturating_add(kernel_space_size);
         axbacktrace::init(
             Range {
                 start: _stext.as_ptr() as usize,
                 end: _etext.as_ptr() as usize,
             },
             Range {
-                start: _edata.as_ptr() as usize,
-                end: usize::MAX,
+                start: fp_range_start,
+                end: fp_range_end,
             },
         );
     }
-
-    let (kernel_space_start, kernel_space_size) = ax_hal::mem::kernel_aspace();
 
     info!(
         "kernel aspace: [{:#x?}, {:#x?})",
@@ -207,60 +263,76 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     );
 
     #[cfg(feature = "paging")]
-    ax_mm::init_memory_management();
-
-    // #[cfg(feature = "plat-dyn")]
-    // ax_driver::setup(arg);
+    {
+        ax_mm::init_memory_management();
+        ax_hal::trap::set_page_fault_handler(runtime_page_fault_handler);
+    }
 
     info!("Initialize platform devices...");
     ax_hal::init_later(cpu_id, arg);
+    if rdrive::is_initialized() {
+        registers::append_linker_registers();
+        #[cfg(feature = "irq")]
+        ax_hal::irq::init_boot_irqs(cpu_id)
+            .unwrap_or_else(|err| panic!("failed to initialize boot IRQs: {err:?}"));
+        #[cfg(not(feature = "irq"))]
+        rdrive::probe_pre_kernel()
+            .unwrap_or_else(|err| panic!("failed to run pre-kernel driver probes: {err:?}"));
+    } else {
+        warn!("rdrive is not initialized; skip pre-kernel driver probe");
+    }
 
     #[cfg(feature = "multitask")]
     ax_task::init_scheduler();
 
     #[cfg(feature = "ipi")]
-    ax_ipi::init();
-
-    #[cfg(feature = "ax-driver")]
     {
-        #[allow(unused_variables)]
-        let all_devices = ax_driver::init_drivers();
-
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "fs-ng")] {
-                ax_fs_ng::init_filesystems(all_devices.block, ax_hal::dtb::get_chosen_bootargs());
-            } else
-            if #[cfg(feature = "fs")] {
-                ax_fs::init_filesystems(all_devices.block, ax_hal::dtb::get_chosen_bootargs());
-            }
-        }
-
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "net-ng")] {
-                ax_net_ng::init_network(all_devices.net);
-
-                #[cfg(feature = "vsock")]
-                ax_net_ng::init_vsock(all_devices.vsock);
-            } else if #[cfg(feature = "net")] {
-                ax_net::init_network(all_devices.net);
-            }
-        }
-
-        #[cfg(feature = "display")]
-        ax_display::init_display(all_devices.display);
-
-        #[cfg(feature = "input")]
-        ax_input::init_input(all_devices.input);
+        ax_ipi::init();
+        #[cfg(feature = "irq")]
+        ax_hal::irq::set_run_on_cpu_sync(ax_ipi_run_on_cpu_sync);
     }
-
-    #[cfg(feature = "smp")]
-    self::mp::start_secondary_cpus(cpu_id);
 
     #[cfg(feature = "irq")]
     {
         info!("Initialize interrupt handlers...");
         init_interrupt();
     }
+
+    // Install the ArceOS runtime glue into the OS-independent Wi-Fi driver
+    // cores (aic8800 / sdhci-cv1800) *before* probing, since the FDT probe
+    // brings the chip up and that needs timing/task capabilities. The cores
+    // declare no ArceOS dependency themselves; this is the adapter layer (see
+    // `wifi_glue`).
+    #[cfg(feature = "aic8800-wifi")]
+    wifi_glue::install_runtime();
+
+    devices::probe_all_devices();
+
+    #[cfg(feature = "serial")]
+    serial::init(cpu_id);
+
+    #[cfg(feature = "rtc")]
+    ax_println!(
+        "Boot at {}\n",
+        chrono::DateTime::from_timestamp_nanos(ax_hal::time::wall_time_nanos() as _),
+    );
+
+    fs::init(ax_hal::boot::bootargs());
+
+    #[cfg(feature = "display")]
+    devices::init_display();
+
+    #[cfg(feature = "input")]
+    devices::init_input();
+
+    #[cfg(feature = "net")]
+    devices::init_net();
+
+    #[cfg(feature = "vsock")]
+    devices::init_vsock();
+
+    #[cfg(feature = "smp")]
+    self::mp::start_secondary_cpus(cpu_id);
 
     #[cfg(all(feature = "tls", not(feature = "multitask")))]
     {
@@ -277,7 +349,13 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
         core::hint::spin_loop();
     }
 
-    unsafe { main() };
+    #[cfg(all(feature = "irq", feature = "ipi"))]
+    ax_ipi::wait_for_all_cpus_ready();
+
+    #[cfg(all(feature = "smp", feature = "ipi"))]
+    fs::online_smp();
+
+    ax_app_entry();
 
     #[cfg(feature = "multitask")]
     ax_task::exit(0);
@@ -288,28 +366,34 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     }
 }
 
-#[cfg(feature = "alloc")]
 fn init_allocator() {
     use ax_hal::mem::{MemRegionFlags, memory_regions, phys_to_virt};
 
     info!("Initialize global memory allocator...");
     info!("  use {} allocator.", ax_alloc::global_allocator().name());
 
+    // The page allocator (which backs user-space page population via
+    // `alloc_pages`) is initialized from a single contiguous region by
+    // `global_init`; every other free region is handed to the byte/heap
+    // allocator by `global_add_memory` (the bitmap page allocator does not
+    // support `add_memory`). So the region chosen for `global_init` *is* the
+    // entire pool available for user memory.
+    //
+    // Pick the LARGEST free region for the page allocator. Platforms with a
+    // single contiguous RAM region (x86/aarch64/riscv64 qemu-virt) are
+    // unaffected (largest == the only region). Platforms with disjoint regions
+    // (loongarch64 qemu-virt: a small ~248 MB low region below the MMIO hole
+    // plus the multi-GB high region at 0x8000_0000) previously picked the small
+    // low region — the "first free region after .bss" heuristic — which capped
+    // all user allocations at ~248 MB regardless of total RAM, OOM'ing large
+    // workloads (e.g. the gradle build JVM) even with gigabytes free.
     let mut max_region_size = 0;
     let mut max_region_paddr = 0.into();
-    let mut use_next_free = false;
 
     for r in memory_regions() {
-        if r.name == ".bss" {
-            use_next_free = true;
-        } else if r.flags.contains(MemRegionFlags::FREE) {
-            if use_next_free {
-                max_region_paddr = r.paddr;
-                break;
-            } else if r.size > max_region_size {
-                max_region_size = r.size;
-                max_region_paddr = r.paddr;
-            }
+        if r.flags.contains(MemRegionFlags::FREE) && r.size > max_region_size {
+            max_region_size = r.size;
+            max_region_paddr = r.paddr;
         }
     }
 
@@ -331,49 +415,151 @@ fn init_allocator() {
 
 #[cfg(feature = "irq")]
 fn init_interrupt() {
-    // Setup timer interrupt handler
-    const PERIODIC_INTERVAL_NANOS: u64 =
-        ax_hal::time::NANOS_PER_SEC / ax_config::TICKS_PER_SEC as u64;
-
-    #[ax_percpu::def_percpu]
-    static NEXT_DEADLINE: u64 = 0;
-
-    fn update_timer() {
-        let now_ns = ax_hal::time::monotonic_time_nanos();
-        // Safety: we have disabled preemption in IRQ handler.
-        let mut deadline = unsafe { NEXT_DEADLINE.read_current_raw() };
-        if now_ns >= deadline {
-            deadline = now_ns + PERIODIC_INTERVAL_NANOS;
-        }
-        unsafe { NEXT_DEADLINE.write_current_raw(deadline + PERIODIC_INTERVAL_NANOS) };
-        ax_hal::time::set_oneshot_timer(deadline);
-    }
-
-    #[cfg(target_arch = "loongarch64")]
-    ax_hal::irq::init_common_irq_handler();
-
-    ax_hal::irq::register(ax_hal::time::irq_num(), || {
-        update_timer();
-        #[cfg(feature = "multitask")]
-        ax_task::on_timer_tick();
-    });
-
-    #[cfg(feature = "ipi")]
-    ax_hal::irq::register(ax_hal::irq::IPI_IRQ, || {
-        ax_ipi::ipi_handler();
-    });
-
-    // Arm the first one-shot timer on the primary CPU. Otherwise the timer
-    // handler may never get the first chance to re-program subsequent ticks.
-    update_timer();
+    init_percpu_irq(ax_hal::percpu::this_cpu_id());
 
     // Enable IRQs before starting app
     ax_hal::asm::enable_irqs();
+
+    #[cfg(feature = "ipi")]
+    ax_ipi::mark_current_cpu_ready();
+}
+
+#[cfg(feature = "irq")]
+pub(crate) fn init_percpu_irq(cpu_id: usize) {
+    ax_hal::irq::cpu_online(cpu_id).expect("failed to mark CPU online for IRQ framework");
+    ax_hal::irq::init_common_irq_handler();
+
+    if ax_hal::percpu::this_cpu_is_bsp() {
+        let cpus = ax_hal::irq::CpuMask::first_n(ax_hal::cpu_num());
+        ax_hal::irq::request_percpu_irq(ax_hal::time::irq_num(), cpus, timer_irq_handler)
+            .expect("failed to register timer IRQ handler");
+
+        #[cfg(any(feature = "ipi", feature = "wake-ipi"))]
+        ax_hal::irq::request_percpu_irq(ax_hal::irq::ipi_irq(), cpus, ipi_irq_handler)
+            .expect("failed to register IPI IRQ handler");
+    }
+
+    init_timer();
+}
+
+#[cfg(all(feature = "irq", feature = "ipi"))]
+unsafe fn ax_ipi_run_on_cpu_sync(
+    cpu: usize,
+    f: unsafe fn(*mut ()),
+    arg: *mut (),
+) -> Result<(), ax_hal::irq::IrqError> {
+    unsafe { ax_ipi::run_on_cpu_sync_raw(cpu, f, arg) }
+}
+
+#[cfg(feature = "irq")]
+fn periodic_interval_nanos() -> u64 {
+    ax_hal::time::NANOS_PER_SEC / ticks_per_sec()
+}
+
+#[cfg(feature = "irq")]
+#[ax_percpu::def_percpu]
+static NEXT_PERIODIC_DEADLINE_NANOS: u64 = 0;
+
+#[cfg(feature = "irq")]
+fn with_periodic_deadline<R>(
+    operation: impl for<'scope> FnOnce(&ax_percpu::CpuPin<'scope>) -> R,
+) -> R {
+    // SAFETY: every caller runs either during offline CPU initialization or in
+    // the local timer IRQ path. Both contexts prevent migration for the whole
+    // callback, and the CPU-local area was installed before runtime entry.
+    unsafe { ax_percpu::with_cpu_pin(operation) }
+        .unwrap_or_else(|error| panic!("timer CPU-local state is invalid: {error}"))
+}
+
+#[cfg(feature = "irq")]
+fn init_timer() {
+    ax_hal::time::enable_timer_irq();
+    let now_ns = ax_hal::time::monotonic_time_nanos();
+    with_periodic_deadline(|pin| {
+        NEXT_PERIODIC_DEADLINE_NANOS
+            .write_current(pin, now_ns.saturating_add(periodic_interval_nanos()));
+    });
+    program_next_timer();
+}
+
+#[cfg(feature = "irq")]
+fn advance_periodic_timer(now_ns: u64) -> bool {
+    let mut deadline = with_periodic_deadline(|pin| NEXT_PERIODIC_DEADLINE_NANOS.read_current(pin));
+    if deadline == 0 {
+        with_periodic_deadline(|pin| {
+            NEXT_PERIODIC_DEADLINE_NANOS
+                .write_current(pin, now_ns.saturating_add(periodic_interval_nanos()));
+        });
+        return false;
+    }
+    if now_ns < deadline {
+        return false;
+    }
+
+    while deadline <= now_ns {
+        deadline = deadline.saturating_add(periodic_interval_nanos());
+        if deadline == u64::MAX {
+            break;
+        }
+    }
+    with_periodic_deadline(|pin| NEXT_PERIODIC_DEADLINE_NANOS.write_current(pin, deadline));
+    true
+}
+
+#[cfg(feature = "irq")]
+fn program_next_timer() {
+    let mut deadline = with_periodic_deadline(|pin| NEXT_PERIODIC_DEADLINE_NANOS.read_current(pin));
+    if deadline == 0 {
+        let now_ns = ax_hal::time::monotonic_time_nanos();
+        deadline = now_ns.saturating_add(periodic_interval_nanos());
+        with_periodic_deadline(|pin| NEXT_PERIODIC_DEADLINE_NANOS.write_current(pin, deadline));
+    }
+    #[cfg(feature = "multitask")]
+    if let Some(task_deadline) = ax_task::next_timer_deadline_nanos() {
+        deadline = core::cmp::min(deadline, task_deadline);
+    }
+
+    ax_hal::time::set_oneshot_timer(deadline);
+    #[cfg(feature = "multitask")]
+    ax_task::note_programmed_timer_deadline_nanos(deadline);
+}
+
+#[cfg(feature = "irq")]
+fn timer_irq_handler(ctx: ax_hal::irq::IrqContext) -> ax_hal::irq::IrqReturn {
+    let _ = ctx;
+    #[cfg(feature = "multitask")]
+    let scheduler_tick = advance_periodic_timer(ax_hal::time::monotonic_time_nanos());
+    #[cfg(not(feature = "multitask"))]
+    let _ = advance_periodic_timer(ax_hal::time::monotonic_time_nanos());
+    #[cfg(feature = "multitask")]
+    ax_task::on_timer_irq(scheduler_tick);
+    program_next_timer();
+    ax_hal::irq::IrqReturn::Handled
+}
+
+#[cfg(all(feature = "irq", feature = "ipi"))]
+fn ipi_irq_handler(_ctx: ax_hal::irq::IrqContext) -> ax_hal::irq::IrqReturn {
+    ax_ipi::ipi_handler();
+    ax_hal::irq::IrqReturn::Handled
+}
+
+#[cfg(all(feature = "irq", feature = "wake-ipi", not(feature = "ipi")))]
+fn ipi_irq_handler(_ctx: ax_hal::irq::IrqContext) -> ax_hal::irq::IrqReturn {
+    ax_hal::irq::IrqReturn::Handled
 }
 
 #[cfg(all(feature = "tls", not(feature = "multitask")))]
 fn init_tls() {
     let main_tls = ax_hal::tls::TlsArea::alloc();
-    unsafe { ax_hal::asm::write_thread_pointer(main_tls.tls_ptr() as usize) };
+    let kernel_tls = ax_hal::context::KernelTlsBase::new(main_tls.tls_ptr() as usize);
+    unsafe { ax_hal::asm::write_thread_pointer(kernel_tls) };
     core::mem::forget(main_tls);
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fs_init_accepts_bootargs_without_fs_feature() {
+        crate::fs::init(Some("root=/dev/nvme0n1"));
+    }
 }

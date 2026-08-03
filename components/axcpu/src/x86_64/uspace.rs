@@ -1,35 +1,53 @@
 //! Structures and functions for user space.
 
-use core::ops::{Deref, DerefMut};
+use core::{
+    mem::{align_of, offset_of, size_of},
+    ops::{Deref, DerefMut},
+};
 
 use ax_memory_addr::VirtAddr;
 use x86_64::{
     registers::{
         control::Cr2,
-        model_specific::{Efer, EferFlags, KernelGsBase, LStar, SFMask, Star},
+        model_specific::{Efer, EferFlags, LStar, SFMask, Star},
         rflags::RFlags,
     },
     structures::idt::ExceptionVector,
 };
 
 use super::{
-    TrapFrame,
-    asm::{read_thread_pointer, write_thread_pointer},
-    gdt,
+    TrapFrame, gdt,
     trap::{IRQ_VECTOR_END, IRQ_VECTOR_START, LEGACY_SYSCALL_VECTOR, err_code_to_flags},
 };
-pub use crate::uspace_common::{ExceptionKind, ReturnReason};
+pub use crate::uspace_common::{ExceptionKind, ExceptionSyndrome, ReturnReason};
 
 /// Context to enter user space.
 #[derive(Debug, Clone, Copy)]
-#[repr(C)]
+#[repr(C, align(16))]
 pub struct UserContext {
     tf: TrapFrame,
     /// FS Segment Base
     pub fs_base: u64,
     /// GS Segment Base
     pub gs_base: u64,
+    /// Kernel FS base saved and restored exclusively by `enter_user`.
+    kernel_fs_base: u64,
 }
+
+const _: () = {
+    // A privilege transition may align TSS.RSP0 down to 16 bytes before
+    // constructing the hardware frame. `enter_user` uses the end of `tf` as
+    // both RSP0 and the boundary above which it saves the kernel continuation,
+    // so both the object and that boundary must already be aligned.
+    assert!(align_of::<UserContext>() >= 16);
+    assert!(size_of::<TrapFrame>().is_multiple_of(16));
+    assert!(offset_of!(UserContext, tf) == 0);
+    assert!(offset_of!(UserContext, fs_base) == size_of::<TrapFrame>());
+    assert!(offset_of!(UserContext, gs_base) == size_of::<TrapFrame>() + size_of::<u64>());
+    assert!(
+        offset_of!(UserContext, kernel_fs_base) == size_of::<TrapFrame>() + 2 * size_of::<u64>()
+    );
+};
 
 impl UserContext {
     /// Creates a new context with the given entry point, user stack pointer,
@@ -48,7 +66,32 @@ impl UserContext {
             },
             fs_base: 0,
             gs_base: 0,
+            kernel_fs_base: 0,
         }
+    }
+
+    /// Normalizes a cloned user context so it can safely return to ring 3.
+    pub fn prepare_clone_child_return_state(&mut self) {
+        let mut flags = RFlags::from_bits_truncate(self.tf.rflags);
+        flags.insert(RFlags::INTERRUPT_FLAG);
+        flags.remove(RFlags::TRAP_FLAG | RFlags::NESTED_TASK | RFlags::RESUME_FLAG);
+        self.tf.rflags = flags.bits();
+    }
+
+    /// Clears the single-step trap flag after a debug exception.
+    ///
+    /// Returns whether the flag had been set in the saved user context.
+    pub fn clear_single_step_after_debug(&mut self) -> bool {
+        let mut flags = RFlags::from_bits_truncate(self.tf.rflags);
+        let was_set = flags.contains(RFlags::TRAP_FLAG);
+        flags.remove(RFlags::TRAP_FLAG);
+        self.tf.rflags = flags.bits();
+        was_set
+    }
+
+    /// Returns the syscall instruction length in bytes.
+    pub const fn syscall_insn_len(&self) -> usize {
+        2
     }
 
     /// Gets the TLS area.
@@ -77,32 +120,25 @@ impl UserContext {
 
         crate::asm::disable_irqs();
 
-        let kernel_fs_base = read_thread_pointer();
-        unsafe { write_thread_pointer(self.fs_base as _) };
-        KernelGsBase::write(x86_64::VirtAddr::new_truncate(self.gs_base));
-
         unsafe { enter_user(self) };
 
-        self.gs_base = KernelGsBase::read().as_u64();
-        self.fs_base = read_thread_pointer() as _;
-        unsafe { write_thread_pointer(kernel_fs_base) };
-
-        let cr2 = Cr2::read().unwrap().as_u64() as usize;
         let vector = self.vector as u8;
 
         const PAGE_FAULT_VECTOR: u8 = ExceptionVector::Page as u8;
 
         let ret = match (vector, err_code_to_flags(self.error_code)) {
-            (PAGE_FAULT_VECTOR, Ok(flags)) => ReturnReason::PageFault(va!(cr2), flags),
+            (PAGE_FAULT_VECTOR, Ok(flags)) => {
+                ReturnReason::PageFault(va!(Cr2::read_raw() as usize), flags)
+            }
             (LEGACY_SYSCALL_VECTOR, _) => ReturnReason::Syscall,
             (IRQ_VECTOR_START..=IRQ_VECTOR_END, _) => {
-                crate::trap::irq_handler(vector as _);
+                crate::trap::dispatch_irq(vector as _);
                 ReturnReason::Interrupt
             }
             _ => ReturnReason::Exception(ExceptionInfo {
                 vector,
                 error_code: self.error_code,
-                cr2,
+                cr2: Cr2::read_raw() as usize,
             }),
         };
 
@@ -137,12 +173,30 @@ pub struct ExceptionInfo {
 }
 
 impl ExceptionInfo {
+    /// Returns the faulting virtual address when the CPU records one.
+    pub const fn fault_addr(&self) -> Option<usize> {
+        Some(self.cr2)
+    }
+
+    /// Returns architecture-neutral syndrome information for this exception.
+    pub const fn syndrome(&self) -> ExceptionSyndrome {
+        ExceptionSyndrome {
+            raw: self.error_code,
+            class: self.vector as u64,
+            iss: 0,
+        }
+    }
+
     /// Returns a generalized kind of this exception.
     pub fn kind(&self) -> ExceptionKind {
         match ExceptionVector::try_from(self.vector) {
             Ok(ExceptionVector::Debug) => ExceptionKind::Debug,
             Ok(ExceptionVector::Breakpoint) => ExceptionKind::Breakpoint,
             Ok(ExceptionVector::InvalidOpcode) => ExceptionKind::IllegalInstruction,
+            // `#DE`: integer divide-by-zero / `INT_MIN / -1`. Linux delivers this
+            // as SIGFPE/FPE_INTDIV; the HotSpot JVM's x86 interpreter and JIT
+            // rely on the trap to raise Java `ArithmeticException`.
+            Ok(ExceptionVector::Division) => ExceptionKind::ArithmeticError,
             _ => ExceptionKind::Other,
         }
     }

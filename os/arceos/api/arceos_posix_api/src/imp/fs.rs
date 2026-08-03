@@ -1,8 +1,11 @@
 use alloc::sync::Arc;
-use core::ffi::{c_char, c_int};
+use core::{
+    ffi::{c_char, c_int},
+    mem::size_of,
+};
 
 use ax_errno::{LinuxError, LinuxResult};
-use ax_fs::fops::OpenOptions;
+use ax_fs_ng::fops::{FileAttrExt, OpenOptions};
 use ax_io::{PollState, SeekFrom};
 use ax_sync::Mutex;
 
@@ -10,11 +13,80 @@ use super::fd_ops::{FileLike, get_file_like};
 use crate::{ctypes, utils::char_ptr_to_str};
 
 pub struct File {
-    inner: Mutex<ax_fs::fops::File>,
+    inner: Mutex<ax_fs_ng::fops::File>,
+}
+
+pub struct Directory {
+    inner: Mutex<ax_fs_ng::fops::Directory>,
+}
+
+#[repr(C, packed)]
+struct LinuxDirent64Head {
+    d_ino: u64,
+    d_off: i64,
+    d_reclen: u16,
+    d_type: u8,
+}
+
+struct DirBuffer<'a> {
+    buf: &'a mut [u8],
+    offset: usize,
+}
+
+impl<'a> DirBuffer<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, offset: 0 }
+    }
+
+    fn used_len(&self) -> usize {
+        self.offset
+    }
+
+    fn remaining_space(&self) -> usize {
+        self.buf.len().saturating_sub(self.offset)
+    }
+
+    fn write_entry(&mut self, d_ino: u64, d_off: i64, d_type: u8, name: &[u8]) -> bool {
+        const NAME_OFFSET: usize = size_of::<LinuxDirent64Head>();
+
+        let name_len = name.len().min(255);
+        let reclen = (NAME_OFFSET + name_len + 1).next_multiple_of(8);
+        if self.remaining_space() < reclen {
+            return false;
+        }
+
+        unsafe {
+            let entry_ptr = self.buf.as_mut_ptr().add(self.offset);
+            entry_ptr
+                .cast::<LinuxDirent64Head>()
+                .write_unaligned(LinuxDirent64Head {
+                    d_ino,
+                    d_off,
+                    d_reclen: reclen as _,
+                    d_type,
+                });
+
+            let name_ptr = entry_ptr.add(NAME_OFFSET);
+            name_ptr.copy_from_nonoverlapping(name.as_ptr(), name_len);
+            name_ptr.add(name_len).write(0);
+        }
+
+        self.offset += reclen;
+        true
+    }
+}
+
+fn file_type_to_d_type(ty: ax_fs_ng::fops::FileType) -> u8 {
+    match ty {
+        ax_fs_ng::fops::FileType::Directory => 4,   // DT_DIR
+        ax_fs_ng::fops::FileType::RegularFile => 8, // DT_REG
+        ax_fs_ng::fops::FileType::Symlink => 10,    // DT_LNK
+        _ => 0,                                     // DT_UNKNOWN
+    }
 }
 
 impl File {
-    fn new(inner: ax_fs::fops::File) -> Self {
+    fn new(inner: ax_fs_ng::fops::File) -> Self {
         Self {
             inner: Mutex::new(inner),
         }
@@ -29,6 +101,25 @@ impl File {
         f.into_any()
             .downcast::<Self>()
             .map_err(|_| LinuxError::EINVAL)
+    }
+}
+
+impl Directory {
+    fn new(inner: ax_fs_ng::fops::Directory) -> Self {
+        Self {
+            inner: Mutex::new(inner),
+        }
+    }
+
+    fn add_to_fd_table(self) -> LinuxResult<c_int> {
+        super::fd_ops::add_file_like(Arc::new(self))
+    }
+
+    fn from_fd(fd: c_int) -> LinuxResult<Arc<Self>> {
+        let f = super::fd_ops::get_file_like(fd)?;
+        f.into_any()
+            .downcast::<Self>()
+            .map_err(|_| LinuxError::ENOTDIR)
     }
 }
 
@@ -67,6 +158,48 @@ impl FileLike for File {
         Ok(PollState {
             readable: true,
             writable: true,
+            readiness_version: 0,
+        })
+    }
+
+    fn set_nonblocking(&self, _nonblocking: bool) -> LinuxResult {
+        Ok(())
+    }
+}
+
+impl FileLike for Directory {
+    fn read(&self, _buf: &mut [u8]) -> LinuxResult<usize> {
+        Err(LinuxError::EISDIR)
+    }
+
+    fn write(&self, _buf: &[u8]) -> LinuxResult<usize> {
+        Err(LinuxError::EISDIR)
+    }
+
+    fn stat(&self) -> LinuxResult<ctypes::stat> {
+        let st_mode = 0o040755;
+        Ok(ctypes::stat {
+            st_ino: 1,
+            st_nlink: 1,
+            st_mode,
+            st_uid: 1000,
+            st_gid: 1000,
+            st_size: 0,
+            st_blocks: 0,
+            st_blksize: 512,
+            ..Default::default()
+        })
+    }
+
+    fn into_any(self: Arc<Self>) -> Arc<dyn core::any::Any + Send + Sync> {
+        self
+    }
+
+    fn poll(&self) -> LinuxResult<PollState> {
+        Ok(PollState {
+            readable: true,
+            writable: false,
+            readiness_version: 0,
         })
     }
 
@@ -111,8 +244,52 @@ pub fn sys_open(filename: *const c_char, flags: c_int, mode: ctypes::mode_t) -> 
     debug!("sys_open <= {filename:?} {flags:#o} {mode:#o}");
     syscall_body!(sys_open, {
         let options = flags_to_options(flags, mode);
-        let file = ax_fs::fops::File::open(filename?, &options)?;
-        File::new(file).add_to_fd_table()
+        let filename = filename?;
+        if (flags as u32) & ctypes::O_DIRECTORY != 0 {
+            let dir = ax_fs_ng::fops::Directory::open_dir(filename, &options)?;
+            Directory::new(dir).add_to_fd_table()
+        } else {
+            let file = ax_fs_ng::fops::File::open(filename, &options)?;
+            File::new(file).add_to_fd_table()
+        }
+    })
+}
+
+/// Read directory entries from `fd` into Linux-style linux_dirent64 buffer.
+///
+/// Reference: Starry OS implementation
+/// Return number of bytes written on success.
+pub unsafe fn sys_getdents64(fd: c_int, buf: *mut u8, len: usize) -> ctypes::ssize_t {
+    debug!("sys_getdents64 <= {fd} {:#x} {len}", buf as usize);
+    syscall_body!(sys_getdents64, {
+        if buf.is_null() || len == 0 {
+            return Err(LinuxError::EINVAL);
+        }
+
+        let dir = Directory::from_fd(fd).map_err(|_| LinuxError::EBADF)?;
+        let mut dir = dir.inner.lock();
+
+        let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+        let mut dir_buf = DirBuffer::new(out);
+
+        let mut entries: [ax_fs_ng::fops::DirEntry; 16] =
+            core::array::from_fn(|_| ax_fs_ng::fops::DirEntry::default());
+        loop {
+            let nr = dir.read_dir(&mut entries)?;
+            if nr == 0 {
+                break;
+            }
+
+            for entry in entries.iter().take(nr) {
+                let d_type = file_type_to_d_type(entry.entry_type());
+                // Linux style: d_ino, d_off both present
+                if !dir_buf.write_entry(1, 0, d_type, entry.name_as_bytes()) {
+                    return Ok(dir_buf.used_len() as ctypes::ssize_t);
+                }
+            }
+        }
+
+        Ok(dir_buf.used_len() as ctypes::ssize_t)
     })
 }
 
@@ -145,7 +322,7 @@ pub unsafe fn sys_stat(path: *const c_char, buf: *mut ctypes::stat) -> c_int {
         }
         let mut options = OpenOptions::new();
         options.read(true);
-        let file = ax_fs::fops::File::open(path?, &options)?;
+        let file = ax_fs_ng::fops::File::open(path?, &options)?;
         let st = File::new(file).stat()?;
         unsafe { *buf = st };
         Ok(0)
@@ -177,7 +354,12 @@ pub unsafe fn sys_lstat(path: *const c_char, buf: *mut ctypes::stat) -> ctypes::
         if buf.is_null() {
             return Err(LinuxError::EFAULT);
         }
-        unsafe { *buf = Default::default() }; // TODO
+        // ArceOS currently doesn't support symbolic links, so lstat behaves the same as stat
+        let mut options = OpenOptions::new();
+        options.read(true);
+        let file = ax_fs_ng::fops::File::open(path?, &options)?;
+        let st = File::new(file).stat()?;
+        unsafe { *buf = st };
         Ok(0)
     })
 }
@@ -191,7 +373,7 @@ pub fn sys_getcwd(buf: *mut c_char, size: usize) -> *mut c_char {
             return Ok(core::ptr::null::<c_char>() as _);
         }
         let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, size as _) };
-        let cwd = ax_fs::api::current_dir()?;
+        let cwd = ax_fs_ng::api::current_dir()?;
         let cwd = cwd.as_bytes();
         if cwd.len() < size {
             dst[..cwd.len()].copy_from_slice(cwd);
@@ -212,7 +394,7 @@ pub fn sys_rename(old: *const c_char, new: *const c_char) -> c_int {
         let old_path = char_ptr_to_str(old)?;
         let new_path = char_ptr_to_str(new)?;
         debug!("sys_rename <= old: {old_path:?}, new: {new_path:?}");
-        ax_fs::api::rename(old_path, new_path)?;
+        ax_fs_ng::api::rename(old_path, new_path)?;
         Ok(0)
     })
 }

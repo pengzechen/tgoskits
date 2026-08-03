@@ -2,9 +2,11 @@ use core::{any::type_name, panic::Location};
 
 use ax_kernel_guard::BaseGuard;
 pub use ax_lockdep::{
-    HeldLock, HeldLockSnapshot, HeldLockStack, KspinLockdepIf, LockdepMap, PreparedAcquire,
-    current_task_held_lock_snapshot, finish_acquire_task, finish_acquire_with_stack,
-    force_release_task, prepare_acquire_with_snapshot, release_from_stack, release_task,
+    DEFAULT_LOCK_SUBCLASS, HeldLock, HeldLockKind, HeldLockSnapshot, HeldLockStack, KspinLockdepIf,
+    LockSubclass, LockdepMap, PreparedAcquire, current_task_held_lock_snapshot,
+    finish_acquire_task, finish_acquire_with_stack, force_release_task,
+    prepare_acquire_with_snapshot, prepare_acquire_with_snapshot_nested,
+    prepare_acquire_with_snapshot_nested_with_sleep, release_from_stack, release_task,
 };
 
 use crate::base::BaseSpinLock;
@@ -12,7 +14,6 @@ use crate::base::BaseSpinLock;
 #[derive(Clone, Copy)]
 pub(crate) struct Lockdep {
     addr: usize,
-    lock_id: Option<u32>,
     inner: ax_lockdep::Lockdep,
     prepared: Option<ax_lockdep::PreparedAcquire>,
 }
@@ -24,23 +25,55 @@ impl Lockdep {
         lock: &BaseSpinLock<G, T>,
         is_try: bool,
     ) -> Self {
+        Self::prepare_nested(lock, is_try, ax_lockdep::DEFAULT_LOCK_SUBCLASS)
+    }
+
+    #[inline(always)]
+    #[track_caller]
+    pub(crate) fn prepare_nested<G: BaseGuard, T: ?Sized>(
+        lock: &BaseSpinLock<G, T>,
+        is_try: bool,
+        subclass: ax_lockdep::LockSubclass,
+    ) -> Self {
         let addr = lock as *const _ as *const () as usize;
-        let prepared = if tracks_task_locks::<G>() {
-            Some(ax_lockdep::prepare_acquire_with_snapshot(
-                lock.lockdep_map(),
-                "spin lock",
+        Self::prepare_map::<G>(
+            lock.lockdep_map(),
+            "spin lock",
+            "spin",
+            addr,
+            is_try,
+            subclass,
+            true,
+        )
+    }
+
+    #[inline(always)]
+    #[track_caller]
+    pub(crate) fn prepare_map<G: BaseGuard>(
+        map: &ax_lockdep::LockdepMap,
+        lock_kind: &'static str,
+        trace_kind: &'static str,
+        addr: usize,
+        is_try: bool,
+        subclass: ax_lockdep::LockSubclass,
+        track_task_lock: bool,
+    ) -> Self {
+        let prepared = if track_task_lock && tracks_task_locks::<G>() {
+            Some(ax_lockdep::prepare_acquire_with_snapshot_nested(
+                map,
+                lock_kind,
                 addr,
                 Location::caller(),
                 ax_lockdep::current_task_held_lock_snapshot(),
+                subclass,
             ))
         } else {
             None
         };
         Self {
             addr,
-            lock_id: prepared.map(ax_lockdep::PreparedAcquire::lock_id),
             inner: ax_lockdep::Lockdep::prepare(
-                "spin",
+                trace_kind,
                 addr,
                 is_try,
                 Some(core::any::type_name::<G>()),
@@ -61,25 +94,30 @@ impl Lockdep {
     pub(crate) fn lock_addr(&self) -> usize {
         self.addr
     }
-
-    #[inline(always)]
-    pub(crate) fn lock_id(&self) -> Option<u32> {
-        self.lock_id
-    }
 }
 
 #[inline(always)]
-pub(crate) fn release<G: BaseGuard>(lock_id: Option<u32>, addr: usize) {
-    if tracks_task_locks::<G>() {
-        ax_lockdep::release_task(lock_id);
-    }
-    ax_lockdep::Lockdep::release("spin", addr, Some(core::any::type_name::<G>()));
+pub(crate) fn release<G: BaseGuard>(addr: usize) {
+    release_kind::<G>("spin", addr);
 }
 
 #[inline(always)]
-pub(crate) fn force_release<G: BaseGuard>(map: &LockdepMap, addr: usize) {
+pub(crate) fn release_kind<G: BaseGuard>(kind: &'static str, addr: usize) {
     if tracks_task_locks::<G>() {
-        ax_lockdep::force_release_task(map);
+        ax_lockdep::release_task(addr);
+    }
+    ax_lockdep::Lockdep::release(kind, addr, Some(core::any::type_name::<G>()));
+}
+
+#[inline(always)]
+pub(crate) fn release_trace_only<G: BaseGuard>(kind: &'static str, addr: usize) {
+    ax_lockdep::Lockdep::release(kind, addr, Some(core::any::type_name::<G>()));
+}
+
+#[inline(always)]
+pub(crate) fn force_release<G: BaseGuard>(addr: usize) {
+    if tracks_task_locks::<G>() {
+        ax_lockdep::force_release_task(addr);
     }
     ax_lockdep::Lockdep::release("spin", addr, Some(core::any::type_name::<G>()));
 }

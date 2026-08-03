@@ -13,7 +13,7 @@ use riscv::{
     register::{scause, sstatus::Sstatus, stval},
 };
 
-pub use crate::uspace_common::{ExceptionKind, ReturnReason};
+pub use crate::uspace_common::{ExceptionKind, ExceptionSyndrome, ReturnReason};
 use crate::{GeneralRegisters, TrapFrame, trap::PageFaultFlags};
 
 /// Context to enter user space.
@@ -31,6 +31,19 @@ impl UserContext {
         #[cfg(feature = "fp-simd")]
         sstatus.set_fs(FS::Initial); // set the FPU to initial state
 
+        #[cfg(feature = "xuantie-c9xx")]
+        {
+            // Enable standard RISC-V VS plus the legacy XThead status bits used
+            // by older C9xx cores. K230 C908V reports standard V in QEMU.
+            const SSTATUS_VS_INITIAL: usize = 0x1 << 9;
+            const XTHEAD_LEGACY_VS_MASK: usize = 0x3 << 23;
+            Self::set_sstatus(
+                &mut sstatus,
+                SSTATUS_VS_INITIAL | XTHEAD_LEGACY_VS_MASK,
+                false,
+            );
+        }
+
         Self(TrapFrame {
             regs: GeneralRegisters {
                 a0: arg0,
@@ -40,6 +53,29 @@ impl UserContext {
             sepc: entry,
             sstatus,
         })
+    }
+
+    /// Normalizes a cloned user context so it can safely return to user mode.
+    pub fn prepare_clone_child_return_state(&mut self) {
+        self.0.sstatus.set_spie(true);
+        self.0.sstatus.set_sum(true);
+        #[cfg(feature = "fp-simd")]
+        if matches!(self.0.sstatus.fs(), FS::Off) {
+            self.0.sstatus.set_fs(FS::Initial);
+        }
+    }
+
+    /// Clears any architecture single-step state after a debug exception.
+    ///
+    /// RISC-V single-step is currently emulated by temporarily patching an
+    /// `ebreak`, so there is no saved CPU flag to clear here.
+    pub const fn clear_single_step_after_debug(&mut self) -> bool {
+        false
+    }
+
+    /// Returns the syscall instruction length in bytes.
+    pub const fn syscall_insn_len(&self) -> usize {
+        4
     }
 
     /// Enter user space.
@@ -53,6 +89,9 @@ impl UserContext {
             fn enter_user(uctx: &mut UserContext);
         }
 
+        // Refresh all instruction caches before entering the user program space to resolve user program errors
+        riscv::asm::fence_i();
+
         crate::asm::disable_irqs();
         unsafe { enter_user(self) };
 
@@ -61,7 +100,7 @@ impl UserContext {
             let stval = stval::read();
             match cause {
                 Trap::Interrupt(_) => {
-                    crate::trap::irq_handler(scause.bits());
+                    crate::trap::dispatch_irq(scause.bits());
                     ReturnReason::Interrupt
                 }
                 Trap::Exception(E::UserEnvCall) => {
@@ -87,6 +126,24 @@ impl UserContext {
 
         crate::asm::enable_irqs();
         ret
+    }
+
+    /// Sets the sstatus register.
+    /// Due to the restriction of Sstatus struct, some bits of the sstatus register cannot be effectively set,
+    /// So this function can effectively set the required bits of sstatus.
+    pub fn set_sstatus(sstatus: &mut Sstatus, bits: usize, is_clear: bool) {
+        if bits == 0 {
+            log::error!("Invalid parameter: {:x}", bits);
+            return;
+        }
+        unsafe {
+            let sstatus_ptr = sstatus as *mut Sstatus as *mut usize;
+            if is_clear {
+                *sstatus_ptr &= !bits;
+            } else {
+                *sstatus_ptr |= bits;
+            }
+        }
     }
 }
 
@@ -114,6 +171,20 @@ pub struct ExceptionInfo {
 }
 
 impl ExceptionInfo {
+    /// Returns the faulting virtual address when the CPU records one.
+    pub const fn fault_addr(&self) -> Option<usize> {
+        Some(self.stval)
+    }
+
+    /// Returns architecture-neutral syndrome information for this exception.
+    pub const fn syndrome(&self) -> ExceptionSyndrome {
+        ExceptionSyndrome {
+            raw: 0,
+            class: self.e as u64,
+            iss: 0,
+        }
+    }
+
     /// Returns a generalized kind of this exception.
     pub fn kind(&self) -> ExceptionKind {
         match self.e {

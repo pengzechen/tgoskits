@@ -7,10 +7,10 @@
 // This file has been modified by KylinSoft on 2025.
 
 use alloc::{
-    borrow::Cow,
     collections::vec_deque::VecDeque,
     sync::{Arc, Weak},
     task::Wake,
+    vec::Vec,
 };
 use core::{
     hash::{Hash, Hasher},
@@ -19,12 +19,18 @@ use core::{
 };
 
 use ax_errno::{AxError, AxResult};
-use ax_kspin::SpinNoPreempt;
-use axpoll::{IoEvents, PollSet, Pollable};
+use ax_kspin::SpinNoIrq;
+use axpoll::{IoEvents, PollSet};
 use bitflags::bitflags;
 use hashbrown::HashMap;
-use linux_raw_sys::general::{EPOLLET, EPOLLONESHOT, epoll_event};
+use linux_raw_sys::general::{EPOLLET, EPOLLEXCLUSIVE, EPOLLONESHOT, epoll_event};
 
+#[cfg(axtest)]
+use super::epoll_axtest::epoll_add_test_barrier;
+use super::epoll_topology::{
+    EpollTopology, EpollTopologyLink, commit_nested_link, detach_nested_link, lock_epoll_topology,
+    prepare_nested_link, reserve_nested_link,
+};
 use crate::file::{FileLike, get_file_like};
 
 pub struct EpollEvent {
@@ -38,6 +44,7 @@ bitflags! {
     pub struct EpollFlags: u32 {
         const EDGE_TRIGGER = EPOLLET;
         const ONESHOT = EPOLLONESHOT;
+        const EXCLUSIVE = EPOLLEXCLUSIVE;
     }
 }
 
@@ -92,12 +99,31 @@ impl TriggerMode {
 }
 
 enum ConsumeResult {
-    // success and should keep in ready list
-    EventAndKeep(EpollEvent),
-    // success and hould remove ready list
-    EventAndRemove(EpollEvent),
+    Event {
+        event: EpollEvent,
+        old_mode: TriggerMode,
+        keep_ready: bool,
+    },
     // no event and should remove ready list
     NoEvent,
+}
+
+fn match_ready_events(current: IoEvents, interested: IoEvents) -> IoEvents {
+    let mut matched = (current & interested) | (current & IoEvents::ALWAYS_POLL);
+    // When the fd is hung up, also force IN so that epoll callers who only
+    // inspect EPOLLIN (a common pattern for pipes/sockets) can detect EOF.
+    // This is safe because a hung-up fd is always readable (read() returns 0
+    // immediately).  Linux epoll reports EPOLLHUP regardless of interest, but
+    // applications that mask on EPOLLIN alone still need to see the event.
+    // Calling `poll(2)` directly is unaffected by this epoll-only convention.
+    if matched.contains(IoEvents::HUP) {
+        matched |= IoEvents::IN;
+    }
+    matched
+}
+
+fn register_events(interested: IoEvents) -> IoEvents {
+    interested | IoEvents::ALWAYS_POLL
 }
 
 #[derive(Clone)]
@@ -118,6 +144,14 @@ impl EntryKey {
     fn get_file(&self) -> Option<Arc<dyn FileLike>> {
         self.file.upgrade()
     }
+
+    #[cfg(axtest)]
+    fn for_test(fd: i32, file: &Arc<dyn FileLike>) -> Self {
+        Self {
+            fd,
+            file: Arc::downgrade(file),
+        }
+    }
 }
 
 impl Hash for EntryKey {
@@ -136,18 +170,32 @@ impl Eq for EntryKey {}
 struct EpollInterest {
     key: EntryKey,
     event: EpollEvent,
-    mode: SpinNoPreempt<TriggerMode>,
+    nested_link: Option<EpollTopologyLink>,
+    mode: SpinNoIrq<TriggerMode>,
+    exclusive: bool,
     in_ready_queue: AtomicBool,
 }
 
 impl EpollInterest {
-    fn new(key: EntryKey, event: EpollEvent, flags: EpollFlags) -> Self {
+    fn new(
+        key: EntryKey,
+        event: EpollEvent,
+        flags: EpollFlags,
+        nested_link: Option<EpollTopologyLink>,
+    ) -> Self {
         Self {
             key,
             event,
-            mode: SpinNoPreempt::new(TriggerMode::from_flags(flags)),
+            nested_link,
+            mode: SpinNoIrq::new(TriggerMode::from_flags(flags)),
+            exclusive: flags.contains(EpollFlags::EXCLUSIVE),
             in_ready_queue: AtomicBool::new(false),
         }
+    }
+
+    #[inline]
+    fn is_exclusive(&self) -> bool {
+        self.exclusive
     }
 
     #[inline]
@@ -174,7 +222,7 @@ impl EpollInterest {
 
     fn consume(&self, file: &dyn FileLike) -> ConsumeResult {
         let current_events = file.poll();
-        let matched = current_events & self.event.events;
+        let matched = match_ready_events(current_events, self.event.events);
 
         // not ready
         if matched.is_empty() {
@@ -182,8 +230,8 @@ impl EpollInterest {
         }
 
         let mut mode = self.mode.lock();
+        let old_mode = *mode;
         let (should_notify, new_mode) = mode.should_notify();
-        *mode = new_mode;
         trace!(
             "consume fd: {} matches {:?} should notify: {} ",
             self.key.fd, matched, should_notify
@@ -193,17 +241,22 @@ impl EpollInterest {
             return ConsumeResult::NoEvent;
         }
 
-        // create event
+        *mode = new_mode;
+
         let event = EpollEvent {
             events: matched,
             user_data: self.event.user_data,
         };
 
-        // shoud still keep in ready?
-        match *mode {
-            TriggerMode::Level => ConsumeResult::EventAndKeep(event),
-            TriggerMode::Edge | TriggerMode::OneShot { .. } => ConsumeResult::EventAndRemove(event),
+        ConsumeResult::Event {
+            event,
+            old_mode,
+            keep_ready: matches!(*mode, TriggerMode::Level),
         }
+    }
+
+    fn restore_mode(&self, mode: TriggerMode) {
+        *self.mode.lock() = mode;
     }
 }
 
@@ -227,38 +280,191 @@ impl Wake for InterestWaker {
         };
 
         if interest.try_mark_in_queue() {
-            epoll
-                .ready_queue
-                .lock()
-                .push_back(Arc::downgrade(&interest));
+            epoll.enqueue_marked_ready(&interest);
             trace!(
                 "Epoll: fd={} added to ready queue, events={:?} wake up poller",
                 interest.key.fd, interest.event.events
             );
-            epoll.poll_ready.wake();
         }
     }
 }
 
-struct EpollInner {
-    interests: SpinNoPreempt<HashMap<EntryKey, Arc<EpollInterest>>>,
-    ready_queue: SpinNoPreempt<VecDeque<Weak<EpollInterest>>>,
+pub(super) struct EpollInner {
+    interests: SpinNoIrq<HashMap<EntryKey, Arc<EpollInterest>>>,
+    pub(super) topology: EpollTopology,
+    ready_queue: SpinNoIrq<VecDeque<Weak<EpollInterest>>>,
+    overflow_ready: AtomicBool,
     poll_ready: PollSet,
 }
 
 impl Default for EpollInner {
     fn default() -> Self {
         Self {
-            interests: SpinNoPreempt::new(HashMap::new()),
-            ready_queue: SpinNoPreempt::new(VecDeque::new()),
+            interests: SpinNoIrq::new(HashMap::new()),
+            topology: EpollTopology::default(),
+            ready_queue: SpinNoIrq::new(VecDeque::new()),
+            overflow_ready: AtomicBool::new(false),
             poll_ready: PollSet::new(),
         }
     }
 }
 
+impl EpollInner {
+    pub(super) fn has_ready_events(&self) -> bool {
+        !self.ready_queue.lock().is_empty() || self.overflow_ready.load(Ordering::Acquire)
+    }
+
+    pub(super) fn register_poll_waiter(&self, context: &Context<'_>) {
+        // Registration happens from epoll wait task context.
+        unsafe { self.poll_ready.register(context.waker(), IoEvents::IN) };
+    }
+
+    /// Remove an interest while the global topology mutex is held.
+    fn remove_interest_locked(&self, key: &EntryKey) -> Option<Arc<EpollInterest>> {
+        let interest = self.interests.lock().remove(key)?;
+        if let Some(link) = &interest.nested_link {
+            detach_nested_link(self, link);
+        }
+        Some(interest)
+    }
+
+    /// Remove a stale snapshot only if it is still the current map entry.
+    fn remove_invalid_interest(&self, candidate: &Arc<EpollInterest>) {
+        let _topology = lock_epoll_topology();
+        let should_remove = self
+            .interests
+            .lock()
+            .get(&candidate.key)
+            .is_some_and(|current| Arc::ptr_eq(current, candidate));
+        if should_remove {
+            self.remove_interest_locked(&candidate.key);
+        }
+    }
+
+    fn reserve_ready_capacity(&self, min_capacity: usize) -> AxResult<()> {
+        loop {
+            if self.ready_queue.lock().capacity() >= min_capacity {
+                return Ok(());
+            }
+
+            let mut replacement = VecDeque::new();
+            replacement
+                .try_reserve(min_capacity)
+                .map_err(|_| AxError::NoMemory)?;
+
+            let mut queue = self.ready_queue.lock();
+            if queue.capacity() >= min_capacity {
+                return Ok(());
+            }
+            if queue.len() > replacement.capacity() {
+                continue;
+            }
+            while let Some(entry) = queue.pop_front() {
+                replacement.push_back(entry);
+            }
+            *queue = replacement;
+            return Ok(());
+        }
+    }
+
+    fn enqueue_marked_ready(&self, interest: &Arc<EpollInterest>) {
+        let queued = {
+            let mut queue = self.ready_queue.lock();
+            if queue.len() == queue.capacity() {
+                queue.retain(|entry| entry.upgrade().is_some());
+            }
+            if queue.len() < queue.capacity() {
+                queue.push_back(Arc::downgrade(interest));
+                true
+            } else {
+                false
+            }
+        };
+
+        if !queued {
+            interest.mark_not_in_queue();
+            self.overflow_ready.store(true, Ordering::Release);
+        }
+        // Ready queue or overflow state is published before waking epoll waiters.
+        unsafe { self.poll_ready.wake(IoEvents::IN) };
+    }
+
+    fn remove_ready_entries_for(&self, target: &Weak<EpollInterest>) {
+        self.ready_queue
+            .lock()
+            .retain(|entry| entry.strong_count() != 0 && !Weak::ptr_eq(entry, target));
+    }
+
+    fn drain_ready_queue(&self) -> AxResult<VecDeque<Weak<EpollInterest>>> {
+        loop {
+            let len = self.ready_queue.lock().len();
+            let mut txlist = VecDeque::new();
+            txlist.try_reserve(len).map_err(|_| AxError::NoMemory)?;
+
+            let mut queue = self.ready_queue.lock();
+            if queue.len() > txlist.capacity() {
+                continue;
+            }
+            while let Some(entry) = queue.pop_front() {
+                txlist.push_back(entry);
+            }
+            return Ok(txlist);
+        }
+    }
+
+    fn snapshot_interests(&self) -> AxResult<Vec<Arc<EpollInterest>>> {
+        loop {
+            let len = self.interests.lock().len();
+            let mut snapshot = Vec::new();
+            snapshot.try_reserve(len).map_err(|_| AxError::NoMemory)?;
+
+            let interests = self.interests.lock();
+            if interests.len() > snapshot.capacity() {
+                continue;
+            }
+            for interest in interests.values() {
+                snapshot.push(Arc::clone(interest));
+            }
+            return Ok(snapshot);
+        }
+    }
+
+    fn enqueue_overflow_ready(&self) -> AxResult<()> {
+        if !self.overflow_ready.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+
+        let result = (|| {
+            let interests = self.snapshot_interests()?;
+            self.reserve_ready_capacity(interests.len())?;
+            for interest in interests {
+                if interest.is_in_queue() || !interest.is_enabled() {
+                    continue;
+                }
+                let Some(file) = interest.key.get_file() else {
+                    self.remove_invalid_interest(&interest);
+                    continue;
+                };
+                if !match_ready_events(file.poll(), interest.event.events).is_empty()
+                    && interest.try_mark_in_queue()
+                {
+                    self.enqueue_marked_ready(&interest);
+                }
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.overflow_ready.store(true, Ordering::Release);
+            // Overflow state is published before waking epoll waiters.
+            unsafe { self.poll_ready.wake(IoEvents::IN) };
+        }
+        result
+    }
+}
+
 #[derive(Default)]
 pub struct Epoll {
-    inner: Arc<EpollInner>,
+    pub(super) inner: Arc<EpollInner>,
 }
 
 impl Epoll {
@@ -282,7 +488,7 @@ impl Epoll {
         }));
 
         let mut context = Context::from_waker(&waker);
-        file.register(&mut context, interest.event.events);
+        file.register(&mut context, register_events(interest.event.events));
     }
 
     // for add/modify
@@ -300,15 +506,15 @@ impl Epoll {
             interest: Arc::downgrade(interest),
         }));
 
-        let current = file.poll() & interest.event.events;
+        let current = match_ready_events(file.poll(), interest.event.events);
 
         if !current.is_empty() {
             waker.wake_by_ref();
         } else {
             let mut context = Context::from_waker(&waker);
-            file.register(&mut context, interest.event.events);
+            file.register(&mut context, register_events(interest.event.events));
 
-            let current = file.poll() & interest.event.events;
+            let current = match_ready_events(file.poll(), interest.event.events);
             if !current.is_empty() {
                 waker.wake_by_ref();
             }
@@ -317,24 +523,95 @@ impl Epoll {
 
     pub fn add(&self, fd: i32, event: EpollEvent, flags: EpollFlags) -> AxResult<()> {
         let key = EntryKey::new(fd)?;
-        let interest = Arc::new(EpollInterest::new(key.clone(), event, flags));
-        let mut guard = self.inner.interests.lock();
-        if guard.contains_key(&key) {
-            return Err(AxError::AlreadyExists);
+        self.add_interest(key, event, flags)
+    }
+
+    fn add_interest(&self, key: EntryKey, event: EpollEvent, flags: EpollFlags) -> AxResult<()> {
+        let nested_target = key
+            .get_file()
+            .and_then(|file| file.downcast_arc::<Epoll>().ok())
+            .map(|epoll| Arc::clone(&epoll.inner));
+
+        #[cfg(axtest)]
+        epoll_add_test_barrier();
+
+        // Lock order for topology mutation is global topology mutex, then one
+        // node's interests/parents/children spinlock. Poll and registration
+        // callbacks run only after the global mutex is released.
+        let topology = lock_epoll_topology();
+        let target_capacity = {
+            let mut interests = self.inner.interests.lock();
+            if interests.contains_key(&key) {
+                return Err(AxError::AlreadyExists);
+            }
+            interests.try_reserve(1).map_err(|_| AxError::NoMemory)?;
+            interests.len() + 1
+        };
+
+        let nested_link = nested_target
+            .as_ref()
+            .map(|target| prepare_nested_link(&self.inner, target))
+            .transpose()?;
+
+        // Complete all fallible allocations before changing either the
+        // interest map or the bidirectional topology.
+        self.inner.reserve_ready_capacity(target_capacity)?;
+        if let Some(target) = &nested_target {
+            reserve_nested_link(&self.inner, target)?;
         }
-        guard.insert(key.clone(), Arc::clone(&interest));
-        drop(guard);
-        trace!("Epoll add fd: {} interest {:?} ", fd, interest.event.events);
+
+        let interest = Arc::new(EpollInterest::new(
+            key.clone(),
+            event,
+            flags,
+            nested_link.clone(),
+        ));
+        self.inner
+            .interests
+            .lock()
+            .insert(key.clone(), Arc::clone(&interest));
+        if let (Some(link), Some(target)) = (&nested_link, &nested_target) {
+            commit_nested_link(&self.inner, target, link);
+        }
+        drop(topology);
+
+        trace!(
+            "Epoll add fd: {} interest {:?} ",
+            key.fd, interest.event.events
+        );
         self.check_and_register_waker(&interest);
         Ok(())
     }
 
+    #[cfg(axtest)]
+    pub(super) fn add_nested_for_test(&self, fd: i32, target: Arc<Epoll>) -> AxResult<()> {
+        let target: Arc<dyn FileLike> = target;
+        self.add_interest(
+            EntryKey::for_test(fd, &target),
+            EpollEvent {
+                events: IoEvents::IN,
+                user_data: 0,
+            },
+            EpollFlags::empty(),
+        )
+    }
+
     pub fn modify(&self, fd: i32, event: EpollEvent, flags: EpollFlags) -> AxResult<()> {
         let key = EntryKey::new(fd)?;
-        let interest = Arc::new(EpollInterest::new(key.clone(), event, flags));
 
+        let topology = lock_epoll_topology();
         let mut guard = self.inner.interests.lock();
         let old = guard.get_mut(&key).ok_or(AxError::NotFound)?;
+        // Linux forbids modifying an entry that was added as exclusive.
+        if old.is_exclusive() {
+            return Err(AxError::InvalidInput);
+        }
+        let interest = Arc::new(EpollInterest::new(
+            key.clone(),
+            event,
+            flags,
+            old.nested_link.clone(),
+        ));
 
         // Preserve ready-queue membership across the swap. The ready_queue
         // only holds Weak<EpollInterest> pointing at the old Arc, so
@@ -346,17 +623,16 @@ impl Epoll {
         // Push a fresh Weak for the replacement interest so poll_events()
         // still finds something to consume.
         let was_in_queue = old.is_in_queue();
+        let old_ready_entry = Arc::downgrade(old);
         if was_in_queue {
             interest.in_ready_queue.store(true, Ordering::Release);
         }
         *old = Arc::clone(&interest);
         drop(guard);
+        drop(topology);
         if was_in_queue {
-            self.inner
-                .ready_queue
-                .lock()
-                .push_back(Arc::downgrade(&interest));
-            self.inner.poll_ready.wake();
+            self.inner.remove_ready_entries_for(&old_ready_entry);
+            self.inner.enqueue_marked_ready(&interest);
         }
         trace!(
             "Epoll: modify fd={}, events={:?}",
@@ -369,31 +645,40 @@ impl Epoll {
 
     pub fn delete(&self, fd: i32) -> AxResult<()> {
         let key = EntryKey::new(fd)?;
-        self.inner
-            .interests
-            .lock()
-            .remove(&key)
+        let topology = lock_epoll_topology();
+        let interest = self
+            .inner
+            .remove_interest_locked(&key)
             .ok_or(AxError::NotFound)?;
+        drop(topology);
+        let ready_entry = Arc::downgrade(&interest);
+        self.inner.remove_ready_entries_for(&ready_entry);
+        interest.mark_not_in_queue();
         trace!("Epoll: delete fd={fd}");
         Ok(())
     }
 
-    pub fn poll_events(&self, out: &mut [epoll_event]) -> AxResult<usize> {
-        trace!("Epoll: poll_events called, out.len()={}", out.len());
+    pub fn poll_events_with(
+        &self,
+        max_events: usize,
+        mut put_event: impl FnMut(usize, epoll_event) -> AxResult<()>,
+    ) -> AxResult<usize> {
+        trace!("Epoll: poll_events_with called, max_events={max_events}");
+
+        self.inner.enqueue_overflow_ready()?;
+
+        // Splice the entire ready_queue into a local txlist, mirroring
+        // Linux's ep_send_events. Visiting each interest at most once per
+        // epoll_wait prevents the LT path from re-feeding the same fd back
+        // into the loop and filling out[] with duplicates of one ready fd.
+        let mut txlist = self.inner.drain_ready_queue()?;
         let mut count = 0;
-        loop {
-            let weak_interest = {
-                let mut queue = self.inner.ready_queue.lock();
-                queue.pop_front()
-            };
+        let mut keep: VecDeque<Weak<EpollInterest>> = VecDeque::new();
 
-            let Some(weak_interest) = weak_interest else {
-                break;
-            };
-
-            if count >= out.len() {
-                self.inner.ready_queue.lock().push_front(weak_interest);
-                break;
+        while let Some(weak_interest) = txlist.pop_front() {
+            if count >= max_events {
+                keep.push_back(weak_interest);
+                continue;
             }
 
             let Some(interest) = weak_interest.upgrade() else {
@@ -402,7 +687,7 @@ impl Epoll {
 
             let Some(file) = interest.key.get_file() else {
                 // file already closed remove interests
-                self.inner.interests.lock().remove(&interest.key);
+                self.inner.remove_invalid_interest(&interest);
                 interest.mark_not_in_queue();
                 continue;
             };
@@ -413,29 +698,72 @@ impl Epoll {
             );
 
             match interest.consume(file.as_ref()) {
-                ConsumeResult::EventAndKeep(event) => {
-                    out[count] = epoll_event {
+                ConsumeResult::Event {
+                    event,
+                    old_mode,
+                    keep_ready,
+                } => {
+                    let event = epoll_event {
                         events: event.events.bits(),
                         data: event.user_data,
                     };
+
+                    if let Err(err) = put_event(count, event) {
+                        interest.restore_mode(old_mode);
+                        interest.in_ready_queue.store(true, Ordering::Release);
+                        self.inner.enqueue_marked_ready(&interest);
+                        for entry in txlist.into_iter().chain(keep) {
+                            if let Some(interest) = entry.upgrade()
+                                && interest.is_in_queue()
+                            {
+                                self.inner.enqueue_marked_ready(&interest);
+                            }
+                        }
+                        return if count == 0 { Err(err) } else { Ok(count) };
+                    }
+
                     count += 1;
-                    self.inner
-                        .ready_queue
-                        .lock()
-                        .push_back(Arc::downgrade(&interest));
-                }
-                ConsumeResult::EventAndRemove(event) => {
-                    out[count] = epoll_event {
-                        events: event.events.bits(),
-                        data: event.user_data,
-                    };
-                    count += 1;
-                    interest.mark_not_in_queue();
-                    self.register_waker_only(&interest);
+                    if keep_ready {
+                        keep.push_back(Arc::downgrade(&interest));
+                    } else {
+                        // EPOLLET edge-triggered: after reporting the fd once,
+                        // it must NOT be reported again until a *new* edge
+                        // (a fresh wakeup) arrives — even if the fd is still
+                        // readable because the caller left data unconsumed
+                        // (man 7 epoll; Linux ep_send_events does not re-add an
+                        // edge-triggered epi to the ready list). Re-arm a fresh
+                        // waker so the next edge transition re-queues the
+                        // interest via InterestWaker::wake_by_ref; do NOT
+                        // re-enqueue based on the current (possibly residual)
+                        // readability, which would degrade EPOLLET into
+                        // level-triggered behavior.
+                        interest.mark_not_in_queue();
+                        self.register_waker_only(&interest);
+                    }
                 }
                 ConsumeResult::NoEvent => {
+                    // Spurious wakeup: the waker fired but file.poll() did
+                    // not match the interest mask (e.g. a shared PollSet
+                    // wake on a socket that has only EPOLLOUT ready when
+                    // the interest is for EPOLLIN).  Re-arm with a plain
+                    // waker registration — using check_and_register_waker
+                    // here would immediately re-queue the interest via
+                    // waker.wake_by_ref() whenever file.poll() is non-empty,
+                    // which a connected TCP socket (always EPOLLOUT-ready)
+                    // satisfies on every iteration, producing a tight loop
+                    // that fills the ready_queue with phantom events.
                     interest.mark_not_in_queue();
                     self.register_waker_only(&interest);
+                }
+            }
+        }
+
+        if !keep.is_empty() {
+            for entry in keep {
+                if let Some(interest) = entry.upgrade()
+                    && interest.is_in_queue()
+                {
+                    self.inner.enqueue_marked_ready(&interest);
                 }
             }
         }
@@ -448,24 +776,50 @@ impl Epoll {
     }
 }
 
-impl FileLike for Epoll {
-    fn path(&self) -> Cow<'_, str> {
-        "anon_inode:[eventpoll]".into()
-    }
-}
+#[cfg(axtest)]
+pub(crate) fn epoll_event_matching_rules_hold_for_test() -> bool {
+    use axpoll::IoEvents as E;
 
-impl Pollable for Epoll {
-    fn poll(&self) -> IoEvents {
-        if self.inner.ready_queue.lock().is_empty() {
-            IoEvents::empty()
-        } else {
-            IoEvents::IN
+    // No overlap between current and interested (and no ALWAYS_POLL bits in
+    // current) yields the empty set.
+    let no_overlap = match_ready_events(E::OUT, E::IN);
+    !no_overlap.contains(E::IN) && !no_overlap.contains(E::OUT)
+        // Always-poll bits (ERR/HUP) in current are forwarded regardless of
+        // the caller's interest mask.
+        && match_ready_events(E::HUP, E::OUT).contains(E::HUP)
+        && match_ready_events(E::ERR, E::empty()).contains(E::ERR)
+        // HUP forces IN even when the caller is not interested in IN, so that
+        // pipes report EOF on EPOLLHUP-only subscriptions.
+        && (match_ready_events(E::HUP, E::OUT).contains(E::IN))
+        // HUP combining with interested IN yields both IN and HUP.
+        && {
+            let m = match_ready_events(E::HUP | E::IN, E::IN);
+            m.contains(E::IN) && m.contains(E::HUP)
         }
-    }
-
-    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
-        if events.contains(IoEvents::IN) {
-            self.inner.poll_ready.register(context.waker());
+        // Interested IN with current IN matches.
+        && match_ready_events(E::IN, E::IN).contains(E::IN)
+        // register_events merges interested with ALWAYS_POLL.
+        && (register_events(E::IN).contains(E::IN) && register_events(E::IN).contains(E::ALWAYS_POLL))
+        && (register_events(E::empty()).contains(E::ALWAYS_POLL) && !register_events(E::empty()).contains(E::IN))
+        // TriggerMode transitions: Level always notifies; Edge always notifies;
+        // OneShot notifies once and then goes silent until restored.
+        && matches!(TriggerMode::from_flags(EpollFlags::empty()), TriggerMode::Level)
+        && matches!(TriggerMode::from_flags(EpollFlags::EDGE_TRIGGER), TriggerMode::Edge)
+        && matches!(
+            TriggerMode::from_flags(EpollFlags::ONESHOT),
+            TriggerMode::OneShot { fired: false }
+        )
+        // should_notify: LT always true; Edge always true; OneShot true once.
+        && TriggerMode::Level.should_notify().0
+        && TriggerMode::Edge.should_notify().0
+        && {
+            let (first, new) = TriggerMode::OneShot { fired: false }.should_notify();
+            let (second, _) = new.should_notify();
+            first && !second
         }
-    }
+        // is_enabled: LT and Edge always enabled; OneShot enabled only before fired.
+        && TriggerMode::Level.is_enabled()
+        && TriggerMode::Edge.is_enabled()
+        && TriggerMode::OneShot { fired: false }.is_enabled()
+        && !TriggerMode::OneShot { fired: true }.is_enabled()
 }

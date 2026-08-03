@@ -5,6 +5,9 @@ use core::arch::asm;
 use aarch64_cpu::{asm::barrier, registers::*};
 use ax_memory_addr::{PhysAddr, VirtAddr};
 
+#[cfg(feature = "tls")]
+use crate::KernelTlsBase;
+
 /// Allows the current CPU to respond to interrupts.
 ///
 /// In AArch64, it unmasks IRQs by clearing the I bit in the `DAIF` register.
@@ -155,7 +158,62 @@ pub fn flush_icache_all() {
     unsafe { asm!("ic iallu; dsb sy; isb") };
 }
 
-/// Flushes the data cache line (64 bytes) at the given virtual address
+#[inline]
+fn read_ctr_el0() -> u64 {
+    let value;
+    unsafe {
+        asm!("mrs {}, ctr_el0", out(reg) value);
+    }
+    value
+}
+
+/// Reads the data cache line size from `CTR_EL0` and returns it in bytes.
+#[inline]
+pub fn dcache_line_size_from_ctr() -> usize {
+    let ctr = read_ctr_el0();
+
+    // CTR_EL0.DminLine: bits [19:16]
+    // bytes = 4 << DminLine
+    let dminline = ((ctr >> 16) & 0xf) as usize;
+
+    4usize << dminline
+}
+
+/// Reads the instruction cache line size from `CTR_EL0` and returns it in bytes.
+#[inline]
+pub fn icache_line_size_from_ctr() -> usize {
+    let ctr = read_ctr_el0();
+
+    // CTR_EL0.IminLine: bits [3:0]
+    // bytes = 4 << IminLine
+    let iminline = (ctr & 0xf) as usize;
+
+    4usize << iminline
+}
+
+/// Cleans a data cache range to the point of unification.
+#[inline]
+pub fn clean_dcache_range_to_pou(vaddr: VirtAddr, size: usize) {
+    if size == 0 {
+        return;
+    }
+
+    let line_size = dcache_line_size_from_ctr();
+    let start = vaddr.as_usize() & !(line_size - 1);
+    let end = (vaddr.as_usize() + size + line_size - 1) & !(line_size - 1);
+
+    for line in (start..end).step_by(line_size) {
+        unsafe { asm!("dc cvau, {0:x}", in(reg) line) };
+    }
+
+    unsafe { asm!("dsb sy") };
+}
+
+/// Cleans and invalidates the data cache line that covers the given address.
+///
+/// This is useful for publishing small pieces of data to other agents that may
+/// observe memory outside the local D-cache, such as spin tables used to start
+/// secondary CPUs.
 #[inline]
 pub fn flush_dcache_line(vaddr: VirtAddr) {
     unsafe { asm!("dc ivac, {0:x}; dsb sy; isb", in(reg) vaddr.as_usize()) };
@@ -175,15 +233,16 @@ pub unsafe fn write_exception_vector_base(vbar: usize) {
     VBAR_EL2.set(vbar as _);
 }
 
-/// Reads the thread pointer of the current CPU (`TPIDR_EL0`).
+/// Reads the current kernel task's TLS base (`TPIDR_EL0`).
 ///
 /// It is used to implement TLS (Thread Local Storage).
 #[inline]
-pub fn read_thread_pointer() -> usize {
-    TPIDR_EL0.get() as usize
+#[cfg(feature = "tls")]
+pub fn read_thread_pointer() -> KernelTlsBase {
+    KernelTlsBase::new(TPIDR_EL0.get() as usize)
 }
 
-/// Writes the thread pointer of the current CPU (`TPIDR_EL0`).
+/// Writes the current kernel task's TLS base (`TPIDR_EL0`).
 ///
 /// It is used to implement TLS (Thread Local Storage).
 ///
@@ -191,8 +250,9 @@ pub fn read_thread_pointer() -> usize {
 ///
 /// This function is unsafe as it changes the current CPU states.
 #[inline]
-pub unsafe fn write_thread_pointer(tpidr_el0: usize) {
-    TPIDR_EL0.set(tpidr_el0 as _)
+#[cfg(feature = "tls")]
+pub unsafe fn write_thread_pointer(kernel_tls: KernelTlsBase) {
+    TPIDR_EL0.set(kernel_tls.as_usize() as _)
 }
 
 /// Enable FP/SIMD instructions by setting the `FPEN` field in `CPACR_EL1`.

@@ -1,212 +1,115 @@
 ---
 name: review-open-prs
-description: Review eligible open GitHub pull requests in this tgoskits repository. Use when the user asks to audit all PRs, review non-self PRs, re-review PRs updated after their last review, use subagents/worktrees for PR review, compare syscall/network/filesystem behavior with POSIX or Linux semantics, run local verification before approving, or submit GitHub approve/request-changes reviews with Chinese inline comments.
+description: Audit open GitHub pull requests in this tgoskits repository, identify non-self PRs that need the current user's review, track the batch with the available todo tool, then dispatch each eligible PR through review-single-pr with its own complete todo and mandatory local runtime validation for every added or changed StarryOS or ArceOS app. Use when the user asks to review all open PRs, review non-self PRs, re-review PRs updated after their last review, or coordinate per-PR review worktrees/subagents.
 ---
 
 # Review Open PRs
 
-## Overview
+## Goal
 
-Review all open PRs that actually need the current user attention, using isolated worktrees and local validation before submitting GitHub reviews. The default outcome is a submitted `APPROVE` review when no blocking issue remains, or a submitted `REQUEST_CHANGES` review with Chinese inline comments when correctness, standards compliance, tests, or CI coverage are insufficient.
+Find open PRs that actually need the current user's attention, then review each eligible PR with `review-single-pr`. This skill is only the multi-PR discovery and dispatch layer; single-PR review standards, validation, inline comments, approval, request-changes, conflict repair, and final submission rules live in `review-single-pr`.
 
-Respect the global subagent policy: spawn subagents only when the user explicitly asks for subagents, delegation, or parallel agent work. If subagents are allowed, use them for bounded per-PR review work and keep final GitHub submission in the main agent.
+By default, do not re-review every open PR. Review PRs the current user has never reviewed, or PRs whose latest commit is newer than the current user's last submitted review. Include draft PRs unless the user explicitly says to skip drafts.
 
-## Eligibility
+Respect the global subagent policy: spawn subagents only when the user explicitly asks for subagents, delegation, or parallel agent work. Even when workers are used, the main agent owns the final GitHub review submission unless the user explicitly assigns that authority elsewhere.
+
+## Todo Orchestration Gate
+
+After the eligibility pass identifies the PRs and before dispatching detailed review work, create a user-visible batch todo with one concrete item for each eligible PR plus batch-level final head refresh, review submission verification, reviewer assignment, and cleanup. When a todo or plan tool such as `update_plan` is available, calling it is mandatory: invoke it and wait for success before dispatch, keep using it, and do not merely recommend it or replace it with a prose checklist. Treat an empty successful response as success unless the tool reports an error. Diagnose or retry a failed tool call before falling back. Use a visible Markdown checklist only when no todo tool is available or the tool is confirmed unusable, and report that reason. If the tool exposes only pending, in-progress, and completed states, mark an item completed only after recording its completed, not-applicable, or blocking outcome and evidence.
+
+The batch todo does not replace the PR-specific todo required by `review-single-pr`. Every dispatched review must inspect the current PR scope, read all applicable instructions and references, create its own complete todo before detailed review or validation, append newly discovered scope, and audit every item before and after submission. Keep no more than one batch item in progress at a time unless independent PR reviews are explicitly delegated.
+
+## Eligibility Pass
 
 1. Resolve repository and user identity:
    ```bash
    gh auth status
    gh repo view --json nameWithOwner,defaultBranchRef,url
-   gh pr list --state open --limit 100 --json number,title,author,headRefName,headRepositoryOwner,baseRefName,updatedAt,isDraft,url,reviewDecision
+   gh pr list --state open --limit 100 --json number,title,author,headRefName,headRepositoryOwner,baseRefName,updatedAt,isDraft,url,reviewDecision,mergeStateStatus,maintainerCanModify
    ```
 2. Exclude PRs authored by the current GitHub user.
-3. For each remaining PR, fetch latest commit and the current user's last review:
+3. For each remaining PR, fetch latest commits, reviews, changed files, and current-head CI/check status:
    ```bash
    gh api "repos/<owner>/<repo>/pulls/<pr>/commits?per_page=100"
    gh api "repos/<owner>/<repo>/pulls/<pr>/reviews?per_page=100"
    gh api "repos/<owner>/<repo>/pulls/<pr>/files?per_page=100"
+   gh pr checks <pr> --repo <owner>/<repo> --watch=false
    ```
-4. Mark a PR eligible when the user has never reviewed it, or the PR latest commit time is newer than the user's last review time. Compare the PR latest commit date against the current user's last submitted review timestamp, not `updatedAt`, because comments, CI, or thread resolution can update the PR without new code.
-5. Include drafts unless the user explicitly says to skip drafts; note draft status in the summary.
-6. For PRs already reviewed at the latest commit, do not submit another review unless the user explicitly asks for a fresh pass. You may still inspect unresolved review threads to decide whether previously requested changes have been resolved.
-7. List excluded PRs and the reason: self-authored, already reviewed at latest commit, closed, or skipped by user scope.
+4. Mark a PR eligible when the current user has never reviewed it, or when the PR latest commit timestamp is newer than the current user's last submitted review timestamp. Compare against the latest commit date, not `updatedAt`, because comments, CI, or thread resolution can update a PR without code changes.
+5. Treat PRs already reviewed by the current user at the latest commit as excluded unless the user explicitly asks for a fresh pass of already-reviewed PRs.
+6. Keep a summary of excluded PRs and the reason: self-authored, already reviewed at latest commit, closed, skipped by user scope, or blocked by a stated constraint.
 
-## Worktrees
+## Validation Strategy
 
-Fetch PR heads and create one isolated worktree per eligible PR:
+Before dispatching an eligible PR, build a concrete validation plan from the current head's CI status, changed files, PR body, commits, and touched docs/runbooks. Carry it into the PR-specific todo rather than treating it as a substitute for that todo.
 
-```bash
-git fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*' '+refs/heads/*:refs/remotes/origin/*'
-git worktree add --detach /home/zhourui/opensource/tgoskits-review-pr<pr> origin/pr/<pr>
+If all relevant CI checks already passed on the current head, do not rerun the same broad local CI-equivalent checks merely to duplicate that evidence. Treat successful CI as coverage evidence for the jobs it actually ran, and spend review time on:
+
+- PR body, README, docs, scripts, and config claims that describe a workflow not executed exactly by CI;
+- app, QEMU, rootfs, board-adjacent, tool-wrapper, packaging, symbolizer, or manual runbook flows whose command, architecture, preparation, or success marker differs from CI;
+- changed tests/configs that CI skipped because of path filters, matrix conditions, draft/branch restrictions, or expected skip behavior;
+- suspicious gaps where CI passed but did not exercise the changed behavior, new architecture, new case discovery, or documented user workflow.
+
+Always follow the per-app hard gate from `review-single-pr`: for every app added, directly changed, or explicitly named in a support claim, verify that the PR body or added/changed documentation gives reproducible environment setup, follow it exactly, and run the real app locally on the current head. Successful CI never removes these todo items. Also run local validation when other CI is failing, missing, stale, suspicious, or skipped for the changed surface. Prefer the narrowest command that checks the uncovered claim instead of a whole-workspace repeat.
+
+Carry this plan into the per-PR review and final report. The report must distinguish:
+
+- `CI covered`: relevant successful check names or workflows that were accepted as remote evidence;
+- `app runtime required`: every affected app, documented setup source, required architecture, exact local command, expected readiness check, and observable postcondition;
+- `app runtime completed or blocking`: current-head local result for every app; when setup or runtime could not complete, the failure stage, key error, unmet condition, and resulting `REQUEST_CHANGES`;
+- `CI-missing validated`: exact documented or PR-body workflow, local/manual command run, architecture or target, and observed postcondition;
+- `CI-missing not validated`: exact workflow or claim, why it was not run, and whether that limitation blocks approval;
+- `duplicative non-app local checks skipped`: non-app CI-equivalent local commands intentionally skipped because current-head CI already covered them.
+
+## Dispatch
+
+For each eligible PR, invoke `review-single-pr` with a prompt that carries the multi-PR context but leaves review decisions to the single-PR skill:
+
+```text
+Use $review-single-pr to review PR #<pr> in <owner>/<repo>.
+
+Context from $review-open-prs:
+- This PR is eligible because <never reviewed by current user | latest commit <sha/time> is newer than current user's last review <time>>.
+- Draft status: <draft|ready>.
+- Merge state: <mergeStateStatus>; maintainer edits: <maintainerCanModify>.
+- Scope requested by user: <scope summary>.
+- Current-head CI summary: <success/failure/pending/skipped counts, relevant check names, stale/missing/suspicious notes>.
+- Validation plan: <CI covered evidence>; <every affected app and its documented environment setup, architecture, exact local runtime command, readiness check, and postcondition>; <other CI-missing PR-body/docs workflows to validate>; <duplicative non-app CI-equivalent local checks to skip>; <commands that still must run because CI is missing/failing/suspicious or review-single-pr requires them>.
+
+Review exactly this PR. After reading every applicable instruction, guideline, and runbook, use the available todo tool to create a complete PR-specific todo before detailed review or validation; use a visible Markdown fallback only when no tool is available or it is confirmed unusable. Follow $review-single-pr for worktree setup, duplicate/superseded fix checks, conflict handling policy, targeted validation, Chinese inline comments, head-SHA freshness checks, and final APPROVE or REQUEST_CHANGES submission. Locally configure and run every affected StarryOS or ArceOS app on the current head even when CI passed; documentation, setup, readiness, or runtime failure requires REQUEST_CHANGES with the exact reason. Audit every todo item before submission and again after reviewer assignment and cleanup.
 ```
 
-Never review multiple StarryOS QEMU cases in the same checkout at the same time. Use separate worktrees for parallel PR review, and do not modify or revert the user's main worktree.
+If workers or subagents are explicitly allowed, give each worker exactly one PR and one worktree. Worker prompts must say:
 
-If a review worktree already exists, verify it is clean and at the expected PR head before reusing it:
-
-```bash
-git -C /home/zhourui/opensource/tgoskits-review-pr<pr> status --short
-git -C /home/zhourui/opensource/tgoskits-review-pr<pr> rev-parse HEAD
-git rev-parse refs/remotes/origin/pr/<pr>
-```
-
-If the existing worktree is stale and clean, update it to the fetched PR head with a non-destructive detached checkout. If it has local changes, do not overwrite them; create a fresh worktree path or ask how to proceed.
-
-When spawning workers, give each worker exactly one PR and one worktree. Tell workers to:
-
-- perform read-only review plus local validation only;
-- not submit GitHub reviews;
+- use `review-single-pr` for the actual review procedure;
+- after reading all applicable instructions and references, use the available todo tool to create and maintain a complete PR-specific todo before detailed review; use a visible Markdown fallback only when no tool is available or confirmed unusable;
+- perform read-only review plus targeted validation only;
+- skip broad non-app local checks that only duplicate already-passing current-head CI, but always follow the documented environment setup and locally run every affected StarryOS or ArceOS app on the current head;
+- do not submit GitHub reviews;
+- do not push contributor branches unless explicitly assigned conflict-repair work, and then prefer local commit only with final push by the main agent;
 - return `APPROVE` or `REQUEST_CHANGES`;
 - provide `path`, `line`, `side=RIGHT`, and Chinese inline comment body for each blocking issue;
 - include commands run and exact failures;
+- report each affected app's setup source, setup commands, readiness result, architecture, runtime command, and postcondition or blocking failure, plus CI-covered evidence, other CI-missing workflows validated, CI-missing workflows not validated with reasons, and non-app CI-equivalent local checks skipped as duplicative;
 - identify missing reproduction tests for bug fixes.
+- audit every todo item before returning and report completed evidence, concrete not-applicable reasons, blocking results, and unfinished items;
+- clean temporary worktrees/files before returning, or report the path and reason when cleanup is unsafe.
 
-## Review Threads
+Before submitting any worker-derived review, the main agent must refresh the PR head, verify each finding still applies to a current right-side diff line, and follow `review-single-pr` submission rules.
 
-Use thread-aware review data whenever the task includes resolving old comments or deciding whether previous requested changes are fixed. Flat review comments are not enough because they omit `isResolved`, `isOutdated`, and thread IDs.
+## Conflict Handling
 
-Fetch review threads with GraphQL:
+For each conflicted eligible PR, dispatch through `review-single-pr`; it owns the conflict policy, including repairing conflicts after an otherwise-approvable review when maintainer edits are allowed. If the user explicitly asks for conflict handling, say that in the dispatch prompt. The main agent must keep conflict repair separate from ordinary review, and must not force-push contributor branches.
 
-```bash
-gh api graphql -F query=@query.graphql -F owner=<owner> -F repo=<repo> -F number=<pr>
-```
+## Final Summary
 
-The query must include `reviewThreads { nodes { id isResolved isOutdated path line diffSide comments(first: 100) { nodes { author { login } body createdAt } } } }`. Detached worktrees cannot rely on `gh pr view` branch inference, so pass `<owner>`, `<repo>`, and `<pr>` explicitly when using helper scripts.
+End with a concise summary of:
 
-When resolving threads:
-
-- resolve only threads whose concrete issue is fixed in the current PR head;
-- keep threads open when the fix is partial, the test is not wired into the runner, or the comment is still behaviorally valid;
-- resolving an old thread does not imply approval if new blocking issues remain;
-- after resolving, fetch threads again and confirm `isResolved=true`.
-
-Resolve with:
-
-```bash
-gh api graphql \
-  -f query='mutation($threadId:ID!){resolveReviewThread(input:{threadId:$threadId}){thread{id isResolved}}}' \
-  -f threadId=<thread-id>
-```
-
-## Review Standards
-
-Review code against the PR's stated intent, existing project patterns, and relevant external semantics:
-
-- POSIX/Linux semantics for syscalls, filesystem errors, process/session/signal behavior, sockets, IPv4/IPv6, `IPV6_V6ONLY`, and `/proc`.
-- RFCs or Linux behavior for networking details such as IPv6 NDP, IPv4-mapped IPv6, dual-stack listeners, route/listen conflicts, and errno behavior.
-- VirtIO, PCI, DMA, MMIO, IRQ, and driver ownership rules for driver changes.
-- Axvisor VM config semantics for `entry_point`, `kernel_load_addr`, `memory_regions`, `map_type`, and guest image layout.
-- StarryOS test-suit layout rules from `starry-test-suit` when test cases or `qemu-*.toml` files change.
-- `cross-kernel-driver` architecture rules when portable driver crates or driver glue change.
-
-For bug fixes, require a reproduction test that fails before the fix and passes after it, unless the environment makes that impossible. If a reproduction cannot be run locally, explain the blocker and what evidence was checked instead.
-
-## Validation
-
-Always run local verification that matches the changed surface. Prefer project `xtask` commands:
-
-- Baseline formatting:
-  ```bash
-  cargo fmt --check
-  ```
-- Changed Rust crate:
-  ```bash
-  cargo xtask clippy --package <crate>
-  ```
-- Crates outside the workspace or special manifests:
-  ```bash
-  cargo clippy --manifest-path <path>/Cargo.toml --all-features -- -D warnings
-  ```
-- StarryOS cases:
-  ```bash
-  cargo xtask starry test qemu --arch <arch> -c <case>
-  ```
-- Axvisor configs:
-  ```bash
-  cargo xtask axvisor build ... --vmconfigs <config>
-  ```
-
-If `cargo xtask` cannot satisfy a special configuration, inspect the relevant `xtask` help or source first, then fall back to a native Cargo command with matched arguments. Record exact command output for failures such as unknown package names, QEMU timeout, missing guest image, or clippy diagnostics.
-
-For StarryOS grouped QEMU cases, verify that newly listed commands are actually installed into the guest overlay. A `qemu-*.toml` `test_commands` entry such as `/usr/bin/<test>` must correspond to a case/subcase asset path that the runner discovers and builds. Running the containing grouped case is the preferred check, for example:
-
-```bash
-cargo xtask starry test qemu --arch x86_64 -c syscall
-```
-
-Treat `/usr/bin/<test>: not found`, `status=127`, skipped discovery, or an unbuilt asset directory as blocking even when the Rust code and clippy pass.
-
-Use GitHub check status only as auxiliary evidence:
-
-```bash
-gh pr checks <pr> --watch=false
-```
-
-Do not approve solely because remote CI passes; local review and targeted validation still matter.
-
-## Findings
-
-Treat these as blocking unless clearly non-blocking:
-
-- behavior differs from POSIX/Linux/RFC/VirtIO semantics;
-- local targeted tests or clippy fail;
-- new tests are not discovered by the project test runner;
-- `success_regex` or `fail_regex` cannot reliably classify the intended StarryOS case result;
-- bug fix lacks a meaningful reproduction test;
-- submitted buffers, DMA memory, queue tokens, or IRQ ownership can be leaked, freed too early, or handled in the wrong layer;
-- a change silently makes CI hang, time out, or skip the new coverage.
-
-Inline comments must be in Chinese, neutral, and project-focused. Each comment should include:
-
-1. the concrete problem;
-2. the relevant standard, project rule, or observed test failure;
-3. a suggested fix.
-
-Prefer commenting on changed lines in the PR diff. If GitHub cannot resolve a comment line, move the comment to the nearest changed line or put it in the review body.
-
-## Submit Reviews
-
-Before submission, confirm the PR head SHA has not changed:
-
-```bash
-gh pr view <pr> --json number,headRefOid,reviewDecision
-```
-
-Submit with the GitHub review API so inline comments and final event land together:
-
-```bash
-gh api --method POST repos/<owner>/<repo>/pulls/<pr>/reviews --input review.json
-```
-
-Use `REQUEST_CHANGES` when there is any blocking issue. Use `APPROVE` when there are no blocking issues; non-blocking suggestions may be included as comments or in the review body.
-
-Inline review payloads must include the current `headRefOid` as `commit_id`, and each inline comment should use a changed-line anchor on `side=RIGHT`:
-
-```json
-{
-  "commit_id": "<headRefOid>",
-  "event": "REQUEST_CHANGES",
-  "body": "...",
-  "comments": [
-    {"path": "path/to/file.rs", "line": 123, "side": "RIGHT", "body": "..."}
-  ]
-}
-```
-
-If a worker returns a finding on a line that is not present on the current PR diff, move the comment to the nearest changed line that demonstrates the problem or put the finding in the review body.
-
-Review body should summarize:
-
-- decision;
-- local validation commands and results;
-- for failing tests, the exact failure mode;
-- for bug fixes, reproduction coverage status;
-- any known environment limitation.
-
-After submission, verify final state:
-
-```bash
-gh pr view <pr> --json number,reviewDecision,latestReviews
-```
-
-End with a concise user summary listing each reviewed PR, decision, key reason, and review link.
+- reviewed PRs, decision, and key reason;
+- PRs excluded from review and why;
+- batch and per-PR todo reconciliation: completed evidence, concrete not-applicable reasons, blocking items, and unfinished items;
+- for every affected app: setup source, preparation result, architecture, current-head local runtime command, observed postcondition, or exact blocking reason;
+- for each reviewed PR: CI-covered evidence, CI-missing PR-body/docs workflows validated locally/manually, CI-missing workflows not validated and why, and non-app CI-equivalent local checks skipped because current-head CI already passed;
+- validation commands that failed, could not be run, or revealed that a documented workflow does not match the PR's claim;
+- any PRs left for the author because of conflicts, missing maintainer edit permission, stale heads, CI gaps, or insufficient local/manual evidence for CI-missing flows;
+- temporary worktrees/files that could not be cleaned and why.

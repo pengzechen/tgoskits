@@ -3,28 +3,23 @@
 use core::arch::asm;
 
 use ax_memory_addr::{MemoryAddr, PhysAddr, VirtAddr};
-use x86::{controlregs, msr, tlb};
+#[cfg(feature = "tls")]
+use x86::msr;
+use x86::{controlregs, tlb};
 use x86_64::instructions::interrupts;
+
+#[cfg(feature = "tls")]
+use crate::KernelTlsBase;
 
 /// Allows the current CPU to respond to interrupts.
 #[inline]
 pub fn enable_irqs() {
-    #[cfg(not(target_os = "none"))]
-    {
-        warn!("enable_irqs: not implemented");
-    }
-    #[cfg(target_os = "none")]
     interrupts::enable()
 }
 
 /// Makes the current CPU to ignore interrupts.
 #[inline]
 pub fn disable_irqs() {
-    #[cfg(not(target_os = "none"))]
-    {
-        warn!("disable_irqs: not implemented");
-    }
-    #[cfg(target_os = "none")]
     interrupts::disable()
 }
 
@@ -39,11 +34,7 @@ pub fn irqs_enabled() -> bool {
 /// It must be called with interrupts enabled, otherwise it will never return.
 #[inline]
 pub fn wait_for_irqs() {
-    if cfg!(target_os = "none") {
-        unsafe { asm!("hlt") }
-    } else {
-        core::hint::spin_loop()
-    }
+    unsafe { asm!("hlt") }
 }
 
 /// Halt the current CPU.
@@ -107,6 +98,10 @@ pub unsafe fn write_kernel_page_table(root_paddr: PhysAddr) {
     unsafe { write_user_page_table(root_paddr) }
 }
 
+/// Flushes the entire instruction cache.
+#[inline]
+pub fn flush_icache_all() {}
+
 /// Flushes the TLB.
 ///
 /// If `vaddr` is [`None`], flushes the entire TLB. Otherwise, flushes the TLB
@@ -120,15 +115,16 @@ pub fn flush_tlb(vaddr: Option<VirtAddr>) {
     }
 }
 
-/// Reads the thread pointer of the current CPU (`FS_BASE`).
+/// Reads the current kernel task's TLS base (`FS_BASE`).
 ///
 /// It is used to implement TLS (Thread Local Storage).
 #[inline]
-pub fn read_thread_pointer() -> usize {
-    unsafe { msr::rdmsr(msr::IA32_FS_BASE) as usize }
+#[cfg(feature = "tls")]
+pub fn read_thread_pointer() -> KernelTlsBase {
+    KernelTlsBase::new(unsafe { msr::rdmsr(msr::IA32_FS_BASE) as usize })
 }
 
-/// Writes the thread pointer of the current CPU (`FS_BASE`).
+/// Writes the current kernel task's TLS base (`FS_BASE`).
 ///
 /// It is used to implement TLS (Thread Local Storage).
 ///
@@ -136,8 +132,9 @@ pub fn read_thread_pointer() -> usize {
 ///
 /// This function is unsafe as it changes the CPU states.
 #[inline]
-pub unsafe fn write_thread_pointer(fs_base: usize) {
-    unsafe { msr::wrmsr(msr::IA32_FS_BASE, fs_base as u64) }
+#[cfg(feature = "tls")]
+pub unsafe fn write_thread_pointer(kernel_tls: KernelTlsBase) {
+    unsafe { msr::wrmsr(msr::IA32_FS_BASE, kernel_tls.as_usize() as u64) }
 }
 
 #[cfg(feature = "uspace")]

@@ -6,10 +6,12 @@ extern crate alloc;
 
 use alloc::{borrow::ToOwned, vec::Vec};
 
+use ax_std as _;
+
 pub const CMDLINE: &[&str] = &["/bin/sh", "-c", include_str!("init.sh")];
 
 #[unsafe(no_mangle)]
-fn main() {
+extern "C" fn main() {
     let args = CMDLINE
         .iter()
         .copied()

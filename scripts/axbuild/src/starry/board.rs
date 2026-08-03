@@ -45,7 +45,9 @@ pub(crate) fn board_dir(workspace_root: &Path) -> anyhow::Result<PathBuf> {
 }
 
 pub(crate) fn load_board_file(path: &Path) -> anyhow::Result<StarryBoardFile> {
-    toml::from_str::<StarryBoardFile>(&fs::read_to_string(path)?)
+    let contents = fs::read_to_string(path)?;
+    crate::build::reject_removed_std_field(path, &contents)?;
+    toml::from_str::<StarryBoardFile>(&contents)
         .map_err(anyhow::Error::from)
         .with_context(|| format!("failed to parse Starry board config {}", path.display()))
 }
@@ -154,10 +156,8 @@ mod tests {
             "z-board",
             r#"
 target = "aarch64-unknown-none-softfloat"
-env = { AX_IP = "10.0.2.15", AX_GW = "10.0.2.2" }
 features = ["qemu"]
 log = "Warn"
-plat_dyn = false
 "#,
         );
         write_board(
@@ -165,10 +165,8 @@ plat_dyn = false
             "a-board",
             r#"
 target = "x86_64-unknown-none"
-env = { AX_IP = "10.0.2.15", AX_GW = "10.0.2.2" }
 features = ["qemu"]
 log = "Warn"
-plat_dyn = false
 "#,
         );
         write_board(
@@ -195,10 +193,8 @@ baud_rate = "1500000"
             "orangepi-5-plus",
             r#"
 target = "aarch64-unknown-none-softfloat"
-env = {}
 features = ["common"]
 log = "Info"
-plat_dyn = true
 "#,
         );
         write_board(
@@ -206,10 +202,8 @@ plat_dyn = true
             "qemu-aarch64",
             r#"
 target = "aarch64-unknown-none-softfloat"
-env = { AX_IP = "10.0.2.15", AX_GW = "10.0.2.2" }
 features = ["qemu"]
 log = "Warn"
-plat_dyn = false
 "#,
         );
         write_board(
@@ -217,15 +211,37 @@ plat_dyn = false
             "qemu-riscv64",
             r#"
 target = "riscv64gc-unknown-none-elf"
-env = { AX_IP = "10.0.2.15", AX_GW = "10.0.2.2" }
-features = ["qemu"]
+features = ["ax-driver/serial", "ax-driver/nvme"]
 log = "Warn"
-plat_dyn = false
 "#,
         );
 
         let board =
             default_board_for_target(root.path(), "aarch64-unknown-none-softfloat").unwrap();
         assert_eq!(board.unwrap().name, "qemu-aarch64");
+    }
+
+    #[test]
+    fn default_qemu_boards_enable_nvme_root_device() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap();
+
+        for board in board_default_list(workspace_root)
+            .unwrap()
+            .into_iter()
+            .filter(|board| board.name.starts_with("qemu-"))
+        {
+            assert!(
+                board
+                    .build_info
+                    .features
+                    .iter()
+                    .any(|feature| feature == "ax-driver/nvme"),
+                "default QEMU board `{}` must enable the NVMe root device driver",
+                board.name
+            );
+        }
     }
 }

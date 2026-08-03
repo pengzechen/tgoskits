@@ -5,15 +5,14 @@ edition.workspace = true
 license.workspace = true
 name = "ax-task"
 repository = "https://github.com/rcore-os/tgoskits"
-version = "0.5.12"
+version = "0.6.6"
 
 [features]
 default = []
 
 irq = ["ax-hal/irq", "dep:ax-timer-list"]
+ipi = ["irq", "ax-hal/ipi", "dep:ax-ipi"]
 multitask = [
-  "stack-canary",
-  "dep:ax-config",
   "dep:axpoll",
   "dep:ax-sched",
   "dep:ax-cpumask",
@@ -26,9 +25,9 @@ multitask = [
   "dep:ax-percpu",
   "dep:spin",
 ]
-preempt = ["irq", "ax-percpu?/preempt", "ax-kernel-guard/preempt"]
+preempt = ["irq", "ax-kernel-guard/preempt"]
 smp = ["ax-kspin/smp"]
-stack-canary = []
+stack-guard-page = ["multitask", "dep:ax-alloc", "dep:ax-mm", "ax-hal/paging"]
 lockdep = [
   "multitask",
   "ax-kspin/lockdep",
@@ -37,27 +36,46 @@ lockdep = [
 ]
 task-ext = ["dep:extern-trait"]
 tls = ["ax-hal/tls"]
+# Cross-crate tracepoint hook for the scheduler context switch.
+# Enabling this exposes a `SchedTracepoint` interface (via `ax-crate-interface`)
+# that another crate (e.g. starry-kernel) must implement; otherwise the link
+# step will fail with an unresolved symbol. Pure ArceOS unikernels leave this
+# off and pay no cost.
+tracepoint-hooks = ["multitask"]
+uspace = ["ax-hal/uspace"]
 
 sched-cfs = ["multitask", "preempt"]
-sched-fifo = ["multitask"]
 sched-rr = ["multitask", "preempt"]
 
-test = ["ax-percpu?/sp-naive"]
+host-test = [
+  "ax-hal/host-test",
+  "ax-kspin?/host-test",
+  "ax-kspin?/smp",
+  "ax-percpu?/host-test",
+]
+test = ["host-test"]
+axtest = ["dep:axtest"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(axtest)'] }
 
 [dependencies]
-ax-config = {workspace = true, optional = true}
+ax-alloc = {workspace = true, optional = true}
 ax-cpumask = { workspace = true, optional = true }
 ax-crate-interface = {workspace = true, optional = true}
 ax-errno.workspace = true
 ax-hal.workspace = true
+ax-ipi = {workspace = true, optional = true}
 ax-kernel-guard = {workspace = true, optional = true}
 ax-lockdep = {workspace = true, optional = true}
 ax-kspin = {workspace = true, optional = true}
 ax-lazyinit = {workspace = true, optional = true}
 ax-memory-addr = {workspace = true, optional = true}
+ax-mm = {workspace = true, optional = true}
 ax-percpu = {workspace = true, optional = true}
 ax-sched = { workspace = true, optional = true }
 ax-timer-list = {workspace = true, optional = true}
+axtest = {workspace = true, optional = true}
 axpoll = {workspace = true, optional = true}
 cfg-if.workspace = true
 extern-trait = {version = "0.4", optional = true}
@@ -70,4 +88,6 @@ spin = {workspace = true, optional = true}
 
 [target.'cfg(not(target_os = "none"))'.dev-dependencies]
 ax-hal = { workspace = true, features = ["fp-simd"] }
-ax-task = { workspace = true, features = ["test", "multitask"] }
+
+[build-dependencies]
+quote = "1.0"

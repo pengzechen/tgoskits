@@ -12,18 +12,27 @@ args = [
   "mon:stdio",
   "-no-reboot",
   "-device",
-  "virtio-blk-pci,drive=disk0",
+  "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
   "-drive",
-  "id=disk0,if=none,format=raw,file=${workspace}/target/rootfs/rootfs-loongarch64-alpine.img",
+  "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-loongarch64-alpine.img",
 ]
 fail_regex = [
   "(?i)\\bpanic(?:ked)?\\b",
   "(?i)kernel panic",
   "(?i)login incorrect",
   "(?i)permission denied",
+  "(?m)^(?:echo|cat|rm):",
 ]
-success_regex = ["Welcome to AxVisor Shell!", "axvisor:\\$"]
-shell_prefix = "axvisor:$"
-shell_init_cmd = ""
-to_bin = false
-uefi = false
+success_regex = [
+  "(?m)^AXVISOR_NVME_RW_PAYLOAD\\s*$",
+  "(?m)^AXVISOR_NVME_ROOTFS_RW_PASSED\\s*$",
+]
+shell_prefix = "axvisor:/$"
+shell_init_cmd = """
+echo AXVISOR_NVME_RW_PAYLOAD > /tmp/axvisor-nvme-rw
+cat /tmp/axvisor-nvme-rw
+rm -f /tmp/axvisor-nvme-rw
+echo AXVISOR_NVME_ROOTFS_RW_PASSED
+"""
+to_bin = true
+uefi = true

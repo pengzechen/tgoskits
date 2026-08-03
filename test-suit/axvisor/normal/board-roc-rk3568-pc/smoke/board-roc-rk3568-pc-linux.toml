@@ -1,8 +1,11 @@
 board_type = "ROC-RK3568-PC"
-fail_regex = []
-shell_init_cmd = "pwd && echo 'test pass'"
-shell_prefix = "root@firefly:~#"
+fail_regex = [
+  "(?i)\\bpanic(?:ked)?\\b",
+  "(?i)kernel panic",
+  "(?i)login incorrect",
+  "(?i)permission denied",
+]
 success_regex = [
-  "(?m)^test pass\\s*$",
+  "(?m)login:",
 ]
 timeout = 300

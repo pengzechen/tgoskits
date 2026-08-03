@@ -1,17 +1,26 @@
-use alloc::{collections::btree_map::BTreeMap, sync::Arc, vec::Vec};
+use alloc::{
+    collections::{btree_map::BTreeMap, btree_set::BTreeSet},
+    sync::Arc,
+    vec::Vec,
+};
 
 use ax_errno::{AxError, AxResult};
-use ax_hal::{
+use ax_memory_addr::{PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
+use ax_runtime::hal::{
     paging::{MappingFlags, PageSize},
     time::monotonic_time_nanos,
 };
-use ax_memory_addr::{PAGE_SIZE_4K, VirtAddr, VirtAddrRange};
 use ax_sync::Mutex;
 use ax_task::current;
-use linux_raw_sys::{ctypes::c_ushort, general::*};
+use bytemuck::AnyBitPattern;
+use linux_raw_sys::general::*;
 use starry_process::Pid;
+use starry_vm::VmMutPtr;
 
-use super::{IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, IpcPerm, next_ipc_id};
+use super::{
+    IPC_CREAT, IPC_EXCL, IPC_INFO, IPC_PRIVATE, IPC_RMID, IPC_SET, IPC_STAT, IpcPerm, SHM_INFO,
+    SHM_STAT, has_ipc_permission, next_ipc_id,
+};
 use crate::{
     mm::{AddrSpace, Backend, SharedPages, UserPtr, nullable},
     task::AsThread,
@@ -49,8 +58,24 @@ pub struct ShmidDs {
     /// pid of last shmop
     shm_lpid: __kernel_pid_t,
     /// number of current attaches
-    shm_nattch: c_ushort,
+    ///
+    /// Linux `shmid64_ds` declares this as `__kernel_ulong_t` (8 bytes on every
+    /// 64-bit arch), NOT `unsigned short`. A narrow field here left the high
+    /// bytes of glibc's `shm_nattch` read uninitialized (garbage attach count).
+    shm_nattch: __kernel_ulong_t,
+    /// Trailing reserved field present in Linux `shmid64_ds` (`__unused4`).
+    __unused4: __kernel_ulong_t,
+    /// Trailing reserved field present in Linux `shmid64_ds` (`__unused5`).
+    __unused5: __kernel_ulong_t,
 }
+
+// `struct shmid64_ds` (asm-generic, shared by aarch64/riscv64/loongarch64 and
+// layout-identical on x86-64): `ipc64_perm` + segsz + 3×time + 2×pid + nattch +
+// 2× trailing reserved word. Guard against accidental re-narrowing or padding.
+const _: () = assert!(
+    core::mem::size_of::<ShmidDs>() == core::mem::size_of::<IpcPerm>() + 64,
+    "ShmidDs must match Linux shmid64_ds layout"
+);
 
 impl ShmidDs {
     fn new(
@@ -81,8 +106,34 @@ impl ShmidDs {
             shm_cpid: pid,
             shm_lpid: pid,
             shm_nattch: 0,
+            __unused4: 0,
+            __unused5: 0,
         }
     }
+}
+
+/// System-wide shared memory info returned by IPC_INFO.
+#[repr(C)]
+#[derive(Clone, Copy, AnyBitPattern)]
+struct ShmInfo64 {
+    shmmax: u64,
+    shmmin: u64,
+    shmmni: u64,
+    shmseg: u64,
+    shmall: u64,
+}
+
+/// Shared memory usage info returned by SHM_INFO.
+#[repr(C)]
+#[derive(Clone, Copy, AnyBitPattern)]
+struct ShmInfo {
+    used_ids: i32,
+    _pad: i32,
+    shm_tot: u64,
+    shm_rss: u64,
+    shm_swp: u64,
+    swap_attempts: u64,
+    swap_successes: u64,
 }
 
 /// This struct is used to maintain the shmem in kernel.
@@ -91,7 +142,7 @@ pub struct ShmInner {
     pub shmid: i32,
     /// Number of pages in the shared memory segment.
     pub page_num: usize,
-    va_range: BTreeMap<Pid, VirtAddrRange>,
+    va_range: BTreeMap<Pid, Vec<VirtAddrRange>>,
     /// physical pages
     pub phys_pages: Option<Arc<SharedPages>>,
     /// whether remove on last detach, see shm_ctl
@@ -100,19 +151,39 @@ pub struct ShmInner {
     pub mapping_flags: MappingFlags,
     /// c type struct, used in shm_ctl
     pub shmid_ds: ShmidDs,
+    /// IPC namespace ID that owns this segment
+    pub ns_id: u64,
 }
 
 impl ShmInner {
     /// Creates a new [`ShmInner`].
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         key: i32,
         shmid: i32,
         size: usize,
-        mapping_flags: MappingFlags,
+        shmflg: usize,
         pid: Pid,
         uid: u32,
         gid: u32,
+        ns_id: u64,
     ) -> Self {
+        let ipc_mode = (shmflg & 0o777) as u16;
+
+        let mut mapping_flags = MappingFlags::from_name("USER").unwrap();
+        if shmflg & 0o400 != 0 {
+            mapping_flags.insert(MappingFlags::READ);
+        }
+        if shmflg & 0o200 != 0 {
+            // RISC-V reserves W=1,R=0 for leaf PTEs; WRITE implies READ here so
+            // the riscv64 PTE layer can auto-correct. This is a page-table-level
+            // workaround and must NOT leak into the user-visible IPC mode.
+            mapping_flags.insert(MappingFlags::WRITE | MappingFlags::READ);
+        }
+        if shmflg & 0o100 != 0 {
+            mapping_flags.insert(MappingFlags::EXECUTE);
+        }
+
         ShmInner {
             shmid,
             page_num: ax_memory_addr::align_up_4k(size) / PAGE_SIZE_4K,
@@ -123,28 +194,27 @@ impl ShmInner {
             shmid_ds: ShmidDs::new(
                 key,
                 size,
-                mapping_flags.bits() as __kernel_mode_t,
+                ipc_mode as __kernel_mode_t,
                 pid as __kernel_pid_t,
                 uid,
                 gid,
             ),
+            ns_id,
         }
     }
 
-    /// Updates the pid of last shmop and checks if the size and mapping flags
-    /// match.
-    pub fn try_update(
-        &mut self,
-        size: usize,
-        mapping_flags: MappingFlags,
-        pid: Pid,
-    ) -> AxResult<isize> {
-        if size as __kernel_size_t != self.shmid_ds.shm_segsz
-            || mapping_flags.bits() as __kernel_mode_t != self.shmid_ds.shm_perm.mode
-        {
+    /// Validates a `shmget` against an existing segment and records the
+    /// pid of the last operation.
+    ///
+    /// Mirrors Linux `shm_more_checks()`: the call is rejected with
+    /// `EINVAL` only when the requested size is larger than the segment.
+    /// The permission bits passed in `shmflg` do not have to match those
+    /// used when the segment was created.
+    pub fn try_update(&mut self, size: usize, pid: Pid) -> AxResult<isize> {
+        if size as __kernel_size_t > self.shmid_ds.shm_segsz {
             return Err(AxError::InvalidInput);
         }
-        self.shmid_ds.shm_lpid = pid as i32;
+        self.shmid_ds.shm_lpid = pid as __kernel_pid_t;
         Ok(self.shmid as isize)
     }
 
@@ -153,39 +223,66 @@ impl ShmInner {
         self.phys_pages = Some(phys_pages);
     }
 
-    /// Returns the number of processes currently attached to this shared memory
-    /// segment.
+    /// Returns the number of current attaches to this shared memory segment.
     pub fn attach_count(&self) -> usize {
-        self.va_range.len()
+        self.va_range.values().map(Vec::len).sum()
     }
 
-    /// Returns the virtual address range associated with the given Pid.
-    pub fn get_addr_range(&self, pid: Pid) -> Option<VirtAddrRange> {
-        self.va_range.get(&pid).cloned()
+    /// Returns all virtual address ranges associated with the given Pid.
+    pub fn get_addr_ranges(&self, pid: Pid) -> Vec<VirtAddrRange> {
+        self.va_range.get(&pid).cloned().unwrap_or_default()
     }
 
-    /// Attach a process to this segment. Returns `Err` if already attached.
-    pub fn attach_process(&mut self, pid: Pid, va_range: VirtAddrRange) -> AxResult {
-        if self.get_addr_range(pid).is_some() {
-            return Err(AxError::InvalidInput);
-        }
-        self.va_range.insert(pid, va_range);
+    /// Returns the virtual address range that starts at the given address.
+    pub fn get_addr_range_by_start(&self, pid: Pid, vaddr: VirtAddr) -> Option<VirtAddrRange> {
+        self.va_range
+            .get(&pid)?
+            .iter()
+            .find(|range| range.start == vaddr)
+            .copied()
+    }
+
+    /// Attach a process to this segment.
+    pub fn attach_process(&mut self, pid: Pid, va_range: VirtAddrRange) {
+        self.va_range.entry(pid).or_default().push(va_range);
         self.shmid_ds.shm_nattch = self.shmid_ds.shm_nattch.saturating_add(1);
         self.shmid_ds.shm_lpid = pid as __kernel_pid_t;
         self.shmid_ds.shm_atime = monotonic_time_nanos() as __kernel_time_t;
-        Ok(())
     }
 
-    /// Detach a process from this segment. Returns `false` if the process
-    /// was already detached (e.g. by a concurrent clear_proc_shm).
-    pub fn detach_process(&mut self, pid: Pid) -> bool {
-        if self.va_range.remove(&pid).is_none() {
+    /// Detach a single attach range from this segment. Returns `false` if the
+    /// range was already detached (e.g. by a concurrent clear_proc_shm).
+    pub fn detach_process_range(&mut self, pid: Pid, vaddr: VirtAddr) -> bool {
+        let Some(ranges) = self.va_range.get_mut(&pid) else {
             return false;
+        };
+        let Some(index) = ranges.iter().position(|range| range.start == vaddr) else {
+            return false;
+        };
+        ranges.remove(index);
+        let empty = ranges.is_empty();
+        if empty {
+            self.va_range.remove(&pid);
         }
         self.shmid_ds.shm_nattch = self.shmid_ds.shm_nattch.saturating_sub(1);
         self.shmid_ds.shm_lpid = pid as __kernel_pid_t;
         self.shmid_ds.shm_dtime = monotonic_time_nanos() as __kernel_time_t;
         true
+    }
+
+    /// Detach all attach ranges owned by a process from this segment.
+    pub fn detach_process(&mut self, pid: Pid) -> usize {
+        let Some(ranges) = self.va_range.remove(&pid) else {
+            return 0;
+        };
+        let attach_count = ranges.len();
+        self.shmid_ds.shm_nattch = self
+            .shmid_ds
+            .shm_nattch
+            .saturating_sub(attach_count as __kernel_ulong_t);
+        self.shmid_ds.shm_lpid = pid as __kernel_pid_t;
+        self.shmid_ds.shm_dtime = monotonic_time_nanos() as __kernel_time_t;
+        attach_count
     }
 }
 
@@ -231,12 +328,6 @@ where
         self.forward.get(key)
     }
 
-    /// Returns a reference to the key corresponding to the given value, if it
-    /// exists.
-    pub fn get_by_value(&self, value: &V) -> Option<&K> {
-        self.reverse.get(value)
-    }
-
     /// Removes a key-value pair by value, returning the key if it existed.
     pub fn remove_by_value(&mut self, value: &V) -> Option<K> {
         if let Some(key) = self.reverse.remove(value) {
@@ -262,12 +353,12 @@ where
 /// processes. note: this struct do not modify the struct ShmInner, but only
 /// manage the mapping.
 pub struct ShmManager {
-    /// key <-> shm_id
-    key_shmid: BiBTreeMap<i32, i32>,
+    /// (key, ns_id) <-> shm_id
+    key_shmid: BiBTreeMap<(i32, u64), i32>,
     /// shm_id -> shm_inner
     shmid_inner: BTreeMap<i32, Arc<Mutex<ShmInner>>>,
-    /// pid -> shm_id <-> vaddr
-    pid_shmid_vaddr: BTreeMap<Pid, BiBTreeMap<i32, VirtAddr>>,
+    /// pid -> vaddr -> shm_id
+    pid_shmid_vaddr: BTreeMap<Pid, BTreeMap<VirtAddr, i32>>,
 }
 
 impl ShmManager {
@@ -279,14 +370,26 @@ impl ShmManager {
         }
     }
 
-    /// Returns the shared memory ID associated with the given key.
-    pub fn get_shmid_by_key(&self, key: i32) -> Option<i32> {
-        self.key_shmid.get_by_key(&key).cloned()
+    /// Returns the shared memory ID associated with the given key and IPC
+    /// namespace.
+    pub fn get_shmid_by_key(&self, key: i32, ns_id: u64) -> Option<i32> {
+        self.key_shmid.get_by_key(&(key, ns_id)).cloned()
     }
 
     /// Returns the shared memory inner structure [`ShmInner`] associated with
-    /// the given shared memory ID.
-    pub fn get_inner_by_shmid(&self, shmid: i32) -> Option<Arc<Mutex<ShmInner>>> {
+    /// the given shared memory ID, validating that it belongs to the specified
+    /// IPC namespace.
+    pub fn get_inner_by_shmid(&self, shmid: i32, ns_id: u64) -> Option<Arc<Mutex<ShmInner>>> {
+        self.shmid_inner
+            .get(&shmid)
+            .filter(|inner| inner.lock().ns_id == ns_id)
+            .cloned()
+    }
+
+    /// Lookup a shm_inner by shmid without namespace validation. Only for
+    /// internal cleanup paths (process exit) where the caller has already
+    /// scoped the lookup by pid.
+    fn get_inner_by_shmid_unchecked(&self, shmid: i32) -> Option<Arc<Mutex<ShmInner>>> {
         self.shmid_inner.get(&shmid).cloned()
     }
 
@@ -295,31 +398,22 @@ impl ShmManager {
     pub fn get_shmid_by_vaddr(&self, pid: Pid, vaddr: VirtAddr) -> Option<i32> {
         self.pid_shmid_vaddr
             .get(&pid)
-            .and_then(|map| map.get_by_value(&vaddr))
+            .and_then(|map| map.get(&vaddr))
             .cloned()
     }
 
     pub(crate) fn get_shmids_by_pid(&self, pid: Pid) -> Option<Vec<i32>> {
         let map = self.pid_shmid_vaddr.get(&pid)?;
-        let mut res = Vec::new();
-        for key in map.forward.keys() {
-            res.push(*key);
+        let mut ids = BTreeSet::new();
+        for shmid in map.values() {
+            ids.insert(*shmid);
         }
-        Some(res)
+        Some(ids.into_iter().collect())
     }
 
-    // used by garbage collection
-    #[allow(dead_code)]
-    fn find_vaddr_by_shmid(&self, pid: Pid, shmid: i32) -> Option<VirtAddr> {
-        self.pid_shmid_vaddr
-            .get(&pid)
-            .and_then(|map| map.get_by_key(&shmid))
-            .cloned()
-    }
-
-    /// Inserts a mapping from a key to a shared memory ID.
-    pub fn insert_key_shmid(&mut self, key: i32, shmid: i32) {
-        self.key_shmid.insert(key, shmid);
+    /// Inserts a mapping from a (key, ns_id) pair to a shared memory ID.
+    pub fn insert_key_shmid(&mut self, key: i32, ns_id: u64, shmid: i32) {
+        self.key_shmid.insert((key, ns_id), shmid);
     }
 
     /// Inserts a mapping from a shared memory ID to its inner
@@ -331,19 +425,18 @@ impl ShmManager {
     /// Inserts a mapping from a process and shared memory ID to a virtual
     /// address.
     pub fn insert_shmid_vaddr(&mut self, pid: Pid, shmid: i32, vaddr: VirtAddr) {
-        // maintain the map 'shmid_vaddr'
         self.pid_shmid_vaddr
             .entry(pid)
             .or_default()
-            .insert(shmid, vaddr);
+            .insert(vaddr, shmid);
     }
 
     /// Removes the mapping from a process and shared memory address.
     pub fn remove_shmaddr(&mut self, pid: Pid, shmaddr: VirtAddr) {
         let mut empty: bool = false;
         if let Some(map) = self.pid_shmid_vaddr.get_mut(&pid) {
-            map.remove_by_value(&shmaddr);
-            empty = map.forward.is_empty();
+            map.remove(&shmaddr);
+            empty = map.is_empty();
         }
         if empty {
             self.pid_shmid_vaddr.remove(&pid);
@@ -366,9 +459,6 @@ impl ShmManager {
     pub fn remove_shmid(&mut self, shmid: i32) {
         self.key_shmid.remove_by_value(&shmid);
         self.shmid_inner.remove(&shmid);
-        // for map in self.pid_shmid_vaddr.values() {
-        // assert!(map.get_by_key(&shmid).is_none());
-        // }
     }
 }
 
@@ -394,7 +484,7 @@ pub fn clear_proc_shm(pid: Pid, aspace: &Arc<Mutex<AddrSpace>>) {
         shmids
             .into_iter()
             .filter_map(|shmid| {
-                let inner = shm_manager.get_inner_by_shmid(shmid)?;
+                let inner = shm_manager.get_inner_by_shmid_unchecked(shmid)?;
                 Some((shmid, inner))
             })
             .collect()
@@ -405,9 +495,7 @@ pub fn clear_proc_shm(pid: Pid, aspace: &Arc<Mutex<AddrSpace>>) {
     let mut ranges: Vec<VirtAddrRange> = Vec::new();
     for (_, shm_inner_arc) in &segments {
         let shm_inner = shm_inner_arc.lock();
-        if let Some(va_range) = shm_inner.get_addr_range(pid) {
-            ranges.push(va_range);
-        }
+        ranges.extend(shm_inner.get_addr_ranges(pid));
     }
     if !ranges.is_empty() {
         let mut aspace = aspace.lock();
@@ -430,51 +518,47 @@ pub fn clear_proc_shm(pid: Pid, aspace: &Arc<Mutex<AddrSpace>>) {
 }
 
 pub fn sys_shmget(key: i32, size: usize, shmflg: usize) -> AxResult<isize> {
+    let curr = current();
+    let thread = curr.as_thread();
+    let cur_pid = thread.proc_data.proc.pid();
+    let cred = thread.cred();
+    let ns_id = thread.proc_data.nsproxy.lock().ipc_ns.lock().ns_id;
+    let mut shm_manager = SHM_MANAGER.lock();
+
+    if key != IPC_PRIVATE {
+        // A segment already exists for this key.
+        if let Some(shmid) = shm_manager.get_shmid_by_key(key, ns_id) {
+            // IPC_CREAT | IPC_EXCL requires the creation to fail when the
+            // segment is already present. See Linux ipcget_public().
+            if shmflg & IPC_CREAT as usize != 0 && shmflg & IPC_EXCL as usize != 0 {
+                return Err(AxError::AlreadyExists);
+            }
+            let shm_inner = shm_manager
+                .get_inner_by_shmid(shmid, ns_id)
+                .ok_or(AxError::NotFound)?;
+            let mut shm_inner = shm_inner.lock();
+            return shm_inner.try_update(size, cur_pid);
+        }
+
+        // No segment exists for this key: create one only when IPC_CREAT
+        // is requested, otherwise the lookup fails with ENOENT.
+        if shmflg & IPC_CREAT as usize == 0 {
+            return Err(AxError::NotFound);
+        }
+    }
+
+    // Creating a new segment: its page-rounded size must be non-zero.
     let page_num = ax_memory_addr::align_up_4k(size) / PAGE_SIZE_4K;
     if page_num == 0 {
         return Err(AxError::InvalidInput);
     }
 
-    let mut mapping_flags = MappingFlags::from_name("USER").unwrap();
-    if shmflg & 0o400 != 0 {
-        mapping_flags.insert(MappingFlags::READ);
-    }
-    if shmflg & 0o200 != 0 {
-        mapping_flags.insert(MappingFlags::WRITE);
-    }
-    if shmflg & 0o100 != 0 {
-        mapping_flags.insert(MappingFlags::EXECUTE);
-    }
-
-    let curr = current();
-    let thread = curr.as_thread();
-    let cur_pid = thread.proc_data.proc.pid();
-    let cred = thread.cred();
-    let mut shm_manager = SHM_MANAGER.lock();
-
-    if key != IPC_PRIVATE {
-        // This process has already created a shared memory segment with the same key
-        if let Some(shmid) = shm_manager.get_shmid_by_key(key) {
-            let shm_inner = shm_manager
-                .get_inner_by_shmid(shmid)
-                .ok_or(AxError::InvalidInput)?;
-            let mut shm_inner = shm_inner.lock();
-            return shm_inner.try_update(size, mapping_flags, cur_pid);
-        }
-    }
-
     // Create a new shm_inner
     let shmid = next_ipc_id();
     let shm_inner = Arc::new(Mutex::new(ShmInner::new(
-        key,
-        shmid,
-        size,
-        mapping_flags,
-        cur_pid,
-        cred.euid,
-        cred.egid,
+        key, shmid, size, shmflg, cur_pid, cred.euid, cred.egid, ns_id,
     )));
-    shm_manager.insert_key_shmid(key, shmid);
+    shm_manager.insert_key_shmid(key, ns_id, shmid);
     shm_manager.insert_shmid_inner(shmid, shm_inner);
 
     Ok(shmid as isize)
@@ -487,15 +571,22 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
     let proc_data = &curr.as_thread().proc_data;
     let pid = proc_data.proc.pid();
 
-    // Lock SHM_MANAGER first, then shm_inner, then aspace. This matches
-    // the ordering used by sys_shmget and avoids the AB/BA deadlock that
-    // the old code caused by locking shm_inner before SHM_MANAGER.
-    let mut shm_manager = SHM_MANAGER.lock();
-    let shm_inner_arc = shm_manager
-        .get_inner_by_shmid(shmid)
-        .ok_or(AxError::InvalidInput)?;
+    info!("shmat pid={pid} shmid={shmid} enter");
+
+    // Grab the shm_inner Arc under SHM_MANAGER, then drop it before
+    // mapping work to avoid holding the global lock across aspace ops.
+    let shm_inner_arc = {
+        let shm_manager = SHM_MANAGER.lock();
+        let ns_id = proc_data.nsproxy.lock().ipc_ns.lock().ns_id;
+        shm_manager
+            .get_inner_by_shmid(shmid, ns_id)
+            .ok_or(AxError::InvalidInput)?
+    };
+    info!("shmat pid={pid} shmid={shmid} lock shm_inner");
     let mut shm_inner = shm_inner_arc.lock();
-    let mut aspace = proc_data.aspace.lock();
+    let aspace_arc = proc_data.aspace();
+    info!("shmat pid={pid} shmid={shmid} lock aspace");
+    let mut aspace = aspace_arc.lock();
 
     let mut mapping_flags = shm_inner.mapping_flags;
     if shm_flg.contains(ShmAtFlags::SHM_RDONLY) {
@@ -508,9 +599,6 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
     let length = shm_inner.page_num * PAGE_SIZE_4K;
 
     // alloc the virtual address range
-    if shm_inner.get_addr_range(pid).is_some() {
-        return Err(AxError::InvalidInput);
-    }
     let start_addr = aspace
         .find_free_area(
             VirtAddr::from(start_aligned),
@@ -530,7 +618,6 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
     let end_addr = VirtAddr::from(start_addr.as_usize() + length);
     let va_range = VirtAddrRange::new(start_addr, end_addr);
 
-    shm_manager.insert_shmid_vaddr(pid, shm_inner.shmid, start_addr);
     info!(
         "Process {} alloc shm virt addr start: {:#x}, size: {}, mapping_flags: {:#x?}",
         pid,
@@ -554,12 +641,95 @@ pub fn sys_shmat(shmid: i32, addr: usize, shmflg: u32) -> AxResult<isize> {
         shm_inner.map_to_phys(pages);
     }
 
-    shm_inner.attach_process(pid, va_range)?;
+    info!("shmat pid={pid} shmid={shmid} mapped; attach_process");
+    shm_inner.attach_process(pid, va_range);
+    drop(aspace);
+    drop(shm_inner);
+
+    info!("shmat pid={pid} shmid={shmid} lock shm_manager for vaddr");
+    let mut shm_manager = SHM_MANAGER.lock();
+    shm_manager.insert_shmid_vaddr(pid, shmid, start_addr);
+    info!("shmat pid={pid} shmid={shmid} done");
     Ok(start_addr.as_usize() as isize)
 }
 
 pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize> {
     let cmd = cmd as i32;
+
+    let curr = current();
+    let thread = curr.as_thread();
+    let cred = thread.cred();
+    let ns_id = thread.proc_data.nsproxy.lock().ipc_ns.lock().ns_id;
+
+    // IPC_INFO: system-wide shared memory limits (no segment lookup).
+    if cmd == IPC_INFO {
+        let shm_manager = SHM_MANAGER.lock();
+        let info = ShmInfo64 {
+            shmmax: usize::MAX as u64,
+            shmmin: 1,
+            shmmni: 4096,
+            shmseg: 4096,
+            shmall: usize::MAX as u64 / PAGE_SIZE_4K as u64,
+        };
+        let ptr = buf.as_ptr() as *mut ShmInfo64;
+        ptr.vm_write(info)?;
+        let ns_count = shm_manager
+            .shmid_inner
+            .values()
+            .filter(|inner| inner.lock().ns_id == ns_id)
+            .count();
+        let max_idx = ns_count.saturating_sub(1) as isize;
+        return Ok(max_idx);
+    }
+
+    // SHM_INFO: shared memory usage statistics for this namespace.
+    if cmd == SHM_INFO {
+        let shm_manager = SHM_MANAGER.lock();
+        let mut used_ids: i32 = 0;
+        let mut shm_tot: u64 = 0;
+        for inner in shm_manager.shmid_inner.values() {
+            let guard = inner.lock();
+            if guard.ns_id == ns_id {
+                used_ids += 1;
+                shm_tot += guard.page_num as u64;
+            }
+        }
+        let info = ShmInfo {
+            used_ids,
+            _pad: 0,
+            shm_tot,
+            shm_rss: shm_tot,
+            shm_swp: 0,
+            swap_attempts: 0,
+            swap_successes: 0,
+        };
+        let ptr = buf.as_ptr() as *mut ShmInfo;
+        ptr.vm_write(info)?;
+        let max_idx = used_ids.saturating_sub(1) as isize;
+        return Ok(max_idx);
+    }
+
+    // SHM_STAT: return the shmid_ds for the shmid at the given index,
+    // counting only segments in this namespace.
+    if cmd == SHM_STAT {
+        let shm_manager = SHM_MANAGER.lock();
+        let result = shm_manager
+            .shmid_inner
+            .iter()
+            .filter(|(_, inner)| inner.lock().ns_id == ns_id)
+            .nth(shmid as usize)
+            .ok_or(AxError::InvalidInput)
+            .and_then(|(actual_shmid, inner)| {
+                let guard = inner.lock();
+                if !has_ipc_permission(&guard.shmid_ds.shm_perm, cred.euid, cred.egid, false) {
+                    return Err(AxError::PermissionDenied);
+                }
+                let ptr = buf.as_ptr();
+                ptr.vm_write(guard.shmid_ds)?;
+                Ok(*actual_shmid as isize)
+            });
+        return result;
+    }
 
     if cmd == IPC_RMID {
         // If no processes are attached, destroy the segment immediately.
@@ -568,7 +738,7 @@ pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize
         // do_shm_rmid() in ipc/shm.c.
         let mut shm_manager = SHM_MANAGER.lock();
         let shm_inner_arc = shm_manager
-            .get_inner_by_shmid(shmid)
+            .get_inner_by_shmid(shmid, ns_id)
             .ok_or(AxError::InvalidInput)?;
         let mut shm_inner = shm_inner_arc.lock();
 
@@ -590,7 +760,7 @@ pub fn sys_shmctl(shmid: i32, cmd: u32, buf: UserPtr<ShmidDs>) -> AxResult<isize
     let shm_inner_arc = {
         let shm_manager = SHM_MANAGER.lock();
         shm_manager
-            .get_inner_by_shmid(shmid)
+            .get_inner_by_shmid(shmid, ns_id)
             .ok_or(AxError::InvalidInput)?
     };
     let mut shm_inner = shm_inner_arc.lock();
@@ -630,39 +800,51 @@ pub fn sys_shmdt(shmaddr: usize) -> AxResult<isize> {
     let proc_data = &curr.as_thread().proc_data;
     let pid = proc_data.proc.pid();
 
+    info!("shmdt pid={pid} addr={shmaddr:?} enter");
+
     // Look up shmid and grab the inner Arc while holding SHM_MANAGER.
     let (shmid, shm_inner_arc) = {
         let shm_manager = SHM_MANAGER.lock();
+        let ns_id = proc_data.nsproxy.lock().ipc_ns.lock().ns_id;
         let shmid = shm_manager
             .get_shmid_by_vaddr(pid, shmaddr)
             .ok_or(AxError::InvalidInput)?;
         let shm_inner_arc = shm_manager
-            .get_inner_by_shmid(shmid)
+            .get_inner_by_shmid(shmid, ns_id)
             .ok_or(AxError::InvalidInput)?;
         (shmid, shm_inner_arc)
     };
 
     // Snapshot the mapped range for this process.
     let va_range = {
+        info!("shmdt pid={pid} lock shm_inner for range");
         let shm_inner = shm_inner_arc.lock();
-        shm_inner.get_addr_range(pid).ok_or(AxError::InvalidInput)?
+        shm_inner
+            .get_addr_range_by_start(pid, shmaddr)
+            .ok_or(AxError::InvalidInput)?
     };
 
     // Unmap while only holding the aspace lock.
     {
-        let mut aspace = proc_data.aspace.lock();
+        info!("shmdt pid={pid} lock aspace for unmap");
+        let aspace_arc = proc_data.aspace();
+        let mut aspace = aspace_arc.lock();
         aspace.unmap(va_range.start, va_range.size())?;
     }
 
     // Reacquire SHM_MANAGER then shm_inner for bookkeeping, matching
     // the global lock ordering.
+    info!("shmdt pid={pid} lock shm_manager for bookkeeping");
     let mut shm_manager = SHM_MANAGER.lock();
     shm_manager.remove_shmaddr(pid, shmaddr);
     let mut shm_inner = shm_inner_arc.lock();
 
-    // detach_process returns false if clear_proc_shm already detached
+    // detach_process_range returns false if clear_proc_shm already detached
     // this pid (race during process exit).
-    if shm_inner.detach_process(pid) && shm_inner.rmid && shm_inner.attach_count() == 0 {
+    if shm_inner.detach_process_range(pid, shmaddr)
+        && shm_inner.rmid
+        && shm_inner.attach_count() == 0
+    {
         drop(shm_inner);
         shm_manager.remove_shmid(shmid);
     }

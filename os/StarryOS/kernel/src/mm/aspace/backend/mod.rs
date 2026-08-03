@@ -7,12 +7,12 @@ use alloc::{
 
 use ax_alloc::{UsageKind, global_allocator};
 use ax_errno::{AxError, AxResult};
-use ax_hal::{
+use ax_memory_addr::{DynPageIter, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
+use ax_memory_set::MappingBackend;
+use ax_runtime::hal::{
     mem::{phys_to_virt, virt_to_phys},
     paging::{MappingFlags, PageSize, PageTable, PageTableCursor},
 };
-use ax_memory_addr::{DynPageIter, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
-use ax_memory_set::MappingBackend;
 use ax_sync::Mutex;
 use enum_dispatch::enum_dispatch;
 
@@ -21,15 +21,23 @@ mod file;
 mod linear;
 mod shared;
 
+#[cfg(axtest)]
+pub(crate) use self::cow::{
+    cow_file_max_read_len_boundary_rules_hold_for_test, private_mmap_eof_check_for_test,
+};
 pub use self::shared::SharedPages;
-use super::AddrSpace;
+pub use super::accounting::RssKind;
+use super::{
+    AddrSpace,
+    accounting::{CloneMapAccounting, MemoryAccounting},
+};
 
 fn divide_page(size: usize, page_size: PageSize) -> usize {
     assert!(page_size.is_aligned(size), "unaligned");
     size >> (page_size as usize).trailing_zeros()
 }
 
-fn alloc_frame(zeroed: bool, size: PageSize) -> AxResult<PhysAddr> {
+pub(crate) fn alloc_frame(zeroed: bool, size: PageSize) -> AxResult<PhysAddr> {
     let page_size = size as usize;
     let num_pages = page_size / PAGE_SIZE_4K;
     let vaddr = VirtAddr::from(
@@ -45,7 +53,7 @@ fn alloc_frame(zeroed: bool, size: PageSize) -> AxResult<PhysAddr> {
     Ok(paddr)
 }
 
-fn dealloc_frame(frame: PhysAddr, align: PageSize) {
+pub(crate) fn dealloc_frame(frame: PhysAddr, align: PageSize) {
     let vaddr = phys_to_virt(frame);
     let page_size: usize = align.into();
     let num_pages = page_size / PAGE_SIZE_4K;
@@ -64,10 +72,21 @@ pub trait BackendOps {
     fn page_size(&self) -> PageSize;
 
     /// Map a memory region.
-    fn map(&self, range: VirtAddrRange, flags: MappingFlags, pt: &mut PageTableCursor) -> AxResult;
+    fn map(
+        &self,
+        range: VirtAddrRange,
+        flags: MappingFlags,
+        acct: Option<&MemoryAccounting>,
+        pt: &mut PageTableCursor,
+    ) -> AxResult;
 
     /// Unmap a memory region.
-    fn unmap(&self, range: VirtAddrRange, pt: &mut PageTableCursor) -> AxResult;
+    fn unmap(
+        &self,
+        range: VirtAddrRange,
+        acct: Option<&MemoryAccounting>,
+        pt: &mut PageTableCursor,
+    ) -> AxResult;
 
     /// Called before a memory region is protected.
     fn on_protect(
@@ -89,6 +108,7 @@ pub trait BackendOps {
         _range: VirtAddrRange,
         _flags: MappingFlags,
         _access_flags: MappingFlags,
+        _acct: Option<&MemoryAccounting>,
         _pt: &mut PageTableCursor,
     ) -> AxResult<(usize, Option<PopulateCallback>)> {
         Ok((0, None))
@@ -107,6 +127,7 @@ pub trait BackendOps {
         old_pt: &mut PageTableCursor,
         new_pt: &mut PageTableCursor,
         new_aspace: &Arc<Mutex<AddrSpace>>,
+        acct: CloneMapAccounting<'_>,
     ) -> AxResult<Backend>;
 
     /// Splits the backend into two at the given position, and returns the backend for the upper part.
@@ -166,6 +187,28 @@ impl Backend {
             Backend::File(b) => b.file_info(),
         }
     }
+
+    /// Clone with a different base address (for mremap moves).
+    /// `src_offset` is the distance from the original VMA start to the
+    /// mremap source address, used to adjust file/page offsets.
+    pub fn relocated(
+        &self,
+        new_start: VirtAddr,
+        src_offset: usize,
+        aspace: &Arc<Mutex<AddrSpace>>,
+    ) -> AxResult<Self> {
+        let adjusted = new_start
+            .as_usize()
+            .checked_sub(src_offset)
+            .map(VirtAddr::from)
+            .ok_or(AxError::InvalidInput)?;
+        Ok(match self {
+            Self::Cow(cb) => Self::Cow(cb.with_start(adjusted)),
+            Self::Shared(sb) => Self::Shared(sb.with_start(adjusted)),
+            Self::Linear(_) => return Err(AxError::OperationNotSupported),
+            Self::File(fb) => Self::File(fb.with_start(adjusted, aspace)),
+        })
+    }
 }
 
 impl MappingBackend for Backend {
@@ -175,7 +218,8 @@ impl MappingBackend for Backend {
 
     fn map(&self, start: VirtAddr, size: usize, flags: MappingFlags, pt: &mut PageTable) -> bool {
         let range = VirtAddrRange::from_start_size(start, size);
-        if let Err(err) = BackendOps::map(self, range, flags, &mut pt.cursor()) {
+        let acct = super::accounting::bridge_rss_accounting();
+        if let Err(err) = BackendOps::map(self, range, flags, acct, &mut pt.cursor()) {
             warn!("Failed to map area: {:?}", err);
             false
         } else {
@@ -185,7 +229,8 @@ impl MappingBackend for Backend {
 
     fn unmap(&self, start: VirtAddr, size: usize, pt: &mut PageTable) -> bool {
         let range = VirtAddrRange::from_start_size(start, size);
-        if let Err(err) = BackendOps::unmap(self, range, &mut pt.cursor()) {
+        let acct = super::accounting::bridge_rss_accounting();
+        if let Err(err) = BackendOps::unmap(self, range, acct, &mut pt.cursor()) {
             warn!("Failed to unmap area: {:?}", err);
             false
         } else {
@@ -206,7 +251,11 @@ impl MappingBackend for Backend {
             warn!("Failed to protect area: {:?}", err);
             return false;
         }
-        cursor.protect_region(start, size, new_flags).is_ok()
+        let pte_flags = match self {
+            Backend::Cow(c) => c.pte_flags_for_protect(new_flags),
+            _ => new_flags,
+        };
+        cursor.protect_region(start, size, pte_flags).is_ok()
     }
 
     fn split(&mut self, align_diff: usize) -> Option<Self> {

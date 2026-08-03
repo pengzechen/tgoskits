@@ -1,6 +1,6 @@
 [package]
 name = "ax-cpu"
-version = "0.6.0"
+version = "0.8.5"
 repository = "https://github.com/rcore-os/tgoskits"
 edition.workspace = true
 authors = [
@@ -22,13 +22,18 @@ license = "Apache-2.0"
 
 [features]
 default = []
+exception-table = []
 fp-simd = []
-tls = []
-uspace = []
+# Use unprivileged host-safe register fallbacks in scheduler tests.
+host-test = []
+tls = ["cpu-local/tls"]
+uspace = ["exception-table"]
 arm-el2 = ["ax-page-table-entry/arm-el2"]
+xuantie-c9xx = ["ax-page-table-entry/xuantie-c9xx"]
 
 [dependencies]
 axbacktrace = { workspace = true }
+cpu-local = { workspace = true }
 cfg-if = "1.0"
 log = "0.4"
 ax-memory-addr = { workspace = true }
@@ -46,7 +51,7 @@ aarch64-cpu = "11.0"
 tock-registers = "0.10"
 
 [target.'cfg(any(target_arch = "riscv32", target_arch = "riscv64"))'.dependencies]
-riscv = "0.16"
+riscv.workspace = true
 
 [target.'cfg(target_arch = "loongarch64")'.dependencies]
 loongArch64 = "0.2"

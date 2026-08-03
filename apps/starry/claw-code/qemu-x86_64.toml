@@ -1,0 +1,32 @@
+timeout = 120
+shell_prefix = "root@starry:"
+uefi = false
+to_bin = false
+success_regex = ["STARRY_CLAW_READY"]
+fail_regex = [
+  "STARRY_CLAW_MISSING",
+  "(?i)panic",
+]
+
+args = [
+  "-nographic",
+  "-m", "512M",
+  "-device", "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
+  "-drive", "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-claw-code.img,file.locking=off",
+  "-device", "virtio-net-pci,netdev=net0",
+  "-netdev", "user,id=net0",
+  "-snapshot",
+]
+
+shell_init_cmd = """
+export HOME=/root
+export USER=root
+export SHELL=/bin/sh
+export TERM=xterm-256color
+export PATH=/usr/local/bin:/usr/bin:/bin:/sbin
+if ! test -x /usr/bin/claw; then
+  printf 'STARRY_%s\n' CLAW_MISSING
+  exit 1
+fi
+printf 'STARRY_%s\n' CLAW_READY
+"""

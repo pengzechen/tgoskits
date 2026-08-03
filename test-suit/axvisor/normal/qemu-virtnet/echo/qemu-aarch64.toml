@@ -1,0 +1,20 @@
+args = [
+  "-nographic",
+  "-cpu",
+  "cortex-a72",
+  "-machine",
+  "virt,virtualization=on,gic-version=3",
+  "-smp",
+  "4",
+  "-m",
+  "8g",
+]
+fail_regex = [
+  "(?i)\\bpanic(?:ked)?\\b",
+  "Failed to initialize guest VM",
+  "UDP_ECHO_MISMATCH",
+]
+success_regex = ["UDP_ECHO_PASS"]
+timeout = 30
+to_bin = true
+uefi = false

@@ -8,6 +8,21 @@ use crate::{
     mm::{UserConstPtr, UserPtr},
 };
 
+fn cmsg_align(len: usize) -> usize {
+    let align = size_of::<usize>();
+    (len + align - 1) & !(align - 1)
+}
+
+fn cmsg_align_down(len: usize) -> usize {
+    let align = size_of::<usize>();
+    len & !(align - 1)
+}
+
+pub fn cmsg_space(len: usize) -> Option<usize> {
+    size_of::<cmsghdr>().checked_add(len).map(cmsg_align)
+}
+
+#[derive(Clone)]
 pub enum CMsg {
     Rights { fds: Vec<Arc<dyn FileLike>> },
 }
@@ -25,9 +40,14 @@ impl CMsg {
                 if data.len() % size_of::<i32>() != 0 {
                     return Err(AxError::InvalidInput);
                 }
+                // Linux caps a single SCM_RIGHTS at SCM_MAX_FD (253) fds;
+                // more fails with EINVAL (net/core/scm.c scm_fp_copy).
+                if data.len() / size_of::<i32>() > 253 {
+                    return Err(AxError::InvalidInput);
+                }
                 let mut fds = Vec::new();
-                for fd in data.chunks_exact(size_of::<i32>()) {
-                    let fd = i32::from_ne_bytes(fd.try_into().unwrap());
+                for fd in data.as_chunks::<{ size_of::<i32>() }>().0 {
+                    let fd = i32::from_ne_bytes(*fd);
                     if fd < 0 {
                         return Err(AxError::BadFileDescriptor);
                     }
@@ -47,41 +67,95 @@ pub struct CMsgBuilder<'a> {
     hdr: UserPtr<cmsghdr>,
     len: &'a mut usize,
     capacity: usize,
+    written: usize,
 }
 impl<'a> CMsgBuilder<'a> {
     pub fn new(msg: UserPtr<cmsghdr>, len: &'a mut usize) -> Self {
         let capacity = *len;
-        *len = 0;
         Self {
             hdr: msg,
             len,
             capacity,
+            written: 0,
         }
     }
 
-    pub fn push(
+    pub fn finish(self) {
+        *self.len = self.written;
+    }
+
+    /// Number of SCM_RIGHTS fds that still fit in the remaining control space.
+    /// Used to deliver as many fds as fit and flag MSG_CTRUNC for the rest,
+    /// matching Linux net/core/scm.c scm_detach_fds.
+    pub fn rights_capacity(&self) -> usize {
+        self.capacity
+            .checked_sub(self.written)
+            .and_then(|remaining| cmsg_align_down(remaining).checked_sub(size_of::<cmsghdr>()))
+            .map_or(0, |body_cap| body_cap / size_of::<i32>())
+    }
+
+    pub fn push_sized(
         &mut self,
         level: u32,
         ty: u32,
+        body_len: usize,
         body: impl FnOnce(&mut [u8]) -> AxResult<usize>,
     ) -> AxResult<bool> {
-        let Some(body_capacity) = (self.capacity - *self.len).checked_sub(size_of::<cmsghdr>())
+        let Some(body_capacity) = self
+            .capacity
+            .checked_sub(self.written)
+            .and_then(|remaining| cmsg_align_down(remaining).checked_sub(size_of::<cmsghdr>()))
         else {
             return Ok(false);
         };
+        if body_capacity < body_len {
+            return Ok(false);
+        }
 
+        let hdr_addr = self.hdr.address().as_usize();
         let hdr = self.hdr.get_as_mut()?;
         hdr.cmsg_level = level as _;
         hdr.cmsg_type = ty as _;
 
-        let data = UserPtr::<u8>::from(self.hdr.address().as_usize() + size_of::<cmsghdr>())
-            .get_as_mut_slice(body_capacity)?;
-        let body_len = body(data)?;
+        let data =
+            UserPtr::<u8>::from(hdr_addr + size_of::<cmsghdr>()).get_as_mut_slice(body_len)?;
+        let written = body(data)?;
+        debug_assert_eq!(written, body_len);
 
-        let cmsg_len = size_of::<cmsghdr>() + body_len;
+        let Some(cmsg_len) = size_of::<cmsghdr>().checked_add(body_len) else {
+            return Err(AxError::InvalidInput);
+        };
         hdr.cmsg_len = cmsg_len;
-        self.hdr = UserPtr::from(hdr as *const _ as usize + cmsg_len);
-        *self.len += cmsg_len;
+        let cmsg_space = cmsg_align(cmsg_len);
+        self.hdr = UserPtr::from(hdr_addr + cmsg_space);
+        self.written += cmsg_space;
         Ok(true)
     }
+}
+
+#[cfg(axtest)]
+pub(crate) fn cmsg_alignment_and_space_rules_hold_for_test() -> bool {
+    // cmsg_align: rounds up to alignment boundary (usize-aligned).
+    let align = size_of::<usize>();
+    assert!(cmsg_align(0) == 0);
+    assert!(cmsg_align(1) == align);
+    assert!(cmsg_align(align) == align);
+    assert!(cmsg_align(align + 1) == 2 * align);
+
+    // cmsg_align_down: rounds down to alignment boundary.
+    assert!(cmsg_align_down(0) == 0);
+    assert!(cmsg_align_down(1) == 0);
+    assert!(cmsg_align_down(align) == align);
+    assert!(cmsg_align_down(align + 1) == align);
+
+    // cmsg_space: returns Some(len + hdr_size) aligned, or None on overflow.
+    let hdr_size = size_of::<cmsghdr>();
+    let space0 = cmsg_space(0).unwrap();
+    assert!(space0 >= hdr_size && space0 % align == 0);
+
+    // Overflow case: very large len should return None.
+    let overflow = cmsg_space(usize::MAX);
+    assert!(overflow.is_none());
+
+    true
 }

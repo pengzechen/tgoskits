@@ -1,0 +1,25 @@
+[package]
+authors = ["周睿 <zrufo747@outlook.com>"]
+categories = ["embedded", "no-std"]
+description = "nvme driver"
+edition.workspace = true
+autotests = false
+keywords = ["os", "nvme", "block", "driver"]
+license = "MIT"
+name = "nvme-driver"
+repository.workspace = true
+version = "0.7.4"
+
+[dependencies]
+dma-api.workspace = true
+log = "0.4"
+mmio-api.workspace = true
+mbarrier = "0.1"
+rdif-block.workspace = true
+spin.workspace = true
+tock-registers = "0.10"
+
+# bare-test integration test is temporarily disabled.
+# [[test]]
+# harness = false
+# name = "test"

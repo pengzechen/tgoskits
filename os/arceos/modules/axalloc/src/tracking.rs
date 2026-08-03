@@ -12,6 +12,10 @@ pub(crate) static TRACKING_ENABLED: AtomicBool = AtomicBool::new(false);
 
 #[ax_percpu::def_percpu]
 pub(crate) static IN_GLOBAL_ALLOCATOR: bool = false;
+// Re-entrancy note: `Backtrace::capture()` now uses `InlineFrames` (stack-allocated
+// array, no heap) so it does NOT re-enter the allocator. The `IN_GLOBAL_ALLOCATOR`
+// guard remains as a safety net for any future code paths that might allocate
+// during backtrace capture.
 
 /// Metadata for each allocation made by the global allocator.
 #[derive(Debug)]
@@ -51,17 +55,23 @@ pub fn tracking_enabled() -> bool {
 }
 
 pub(crate) fn with_state<R>(f: impl FnOnce(Option<&mut GlobalState>) -> R) -> R {
-    IN_GLOBAL_ALLOCATOR.with_current(|in_global| {
-        if *in_global || !tracking_enabled() {
-            f(None)
-        } else {
-            *in_global = true;
+    let _guard = ax_kernel_guard::NoPreempt::new();
+    // SAFETY: the guard prevents migration throughout all accesses below.
+    unsafe {
+        ax_percpu::with_cpu_pin(|pin| {
+            if IN_GLOBAL_ALLOCATOR.read_current(pin) || !tracking_enabled() {
+                return f(None);
+            }
+
+            IN_GLOBAL_ALLOCATOR.write_current(pin, true);
             let mut state = STATE.lock();
             let result = f(Some(&mut state));
-            *in_global = false;
+            drop(state);
+            IN_GLOBAL_ALLOCATOR.write_current(pin, false);
             result
-        }
-    })
+        })
+    }
+    .expect("allocator tracking requires an installed CPU area")
 }
 
 /// Returns the current generation of the global allocator.

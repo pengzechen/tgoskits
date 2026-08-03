@@ -1,0 +1,32 @@
+# Example only: this is not part of the StarryOS test-suit or CI.
+args = [
+    "-machine",
+    "q35",
+    "-nographic",
+    "-m",
+    "2G",
+    "-device",
+    "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
+    "-drive",
+    "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-alpine.img",
+    "-device",
+    "virtio-net-pci,netdev=net0",
+    "-netdev",
+    "user,id=net0",
+    "-snapshot",
+]
+uefi = false
+to_bin = false
+shell_prefix = "root@starry:"
+shell_init_cmd = "/usr/bin/codex-offline-smoke.sh"
+success_regex = ["(?m)^STARRY_CODEX_STAGE_G_CODEX_HELP_PASSED\\s*$"]
+fail_regex = [
+    "(?i)\\bpanic(?:ked)?\\b",
+    "(?i)page fault",
+    "(?i)segmentation fault",
+    "(?i)codex.*fatal",
+    "No such process",
+    "sys_prctl: unsupported option 23",
+    "(?m)^STARRY_CODEX_STAGE_G_CODEX_HELP_FAILED\\s*$",
+]
+timeout = 420

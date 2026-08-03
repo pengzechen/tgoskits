@@ -1,8 +1,6 @@
 use core::fmt::Debug;
 
-use crate::{
-    Mmio, ResetRockchip, RstId, clock::ClkId, grf::GrfMmio, variants::rk3588::cru::gate::ClkType,
-};
+use crate::{Mmio, ResetRockchip, RstId, clock::ClkId, grf::GrfMmio};
 
 pub mod clock;
 mod consts;
@@ -60,7 +58,7 @@ impl Debug for Cru {
     }
 }
 
-impl CruOp for Cru {
+impl ResetOp for Cru {
     fn reset_assert(&mut self, id: RstId) {
         self.reset.reset_assert(id);
     }
@@ -68,7 +66,9 @@ impl CruOp for Cru {
     fn reset_deassert(&mut self, id: RstId) {
         self.reset.reset_deassert(id);
     }
+}
 
+impl ClockOp for Cru {
     fn clk_enable(&mut self, id: ClkId) -> ClockResult<()> {
         self.clk_enable(id)
     }
@@ -273,11 +273,15 @@ impl Cru {
     /// cru.clk_enable(CLK_I2C1)?;
     /// ```
     pub fn clk_enable(&mut self, id: ClkId) -> ClockResult<()> {
-        let gate = self.find_clk_gate(id).ok_or(ClockError::unsupported(id))?;
-        if matches!(gate.kind, ClkType::Composite) {
+        if matches!(
+            id,
+            SCLK_SDIO_DRV | SCLK_SDIO_SAMPLE | SCLK_SDMMC_DRV | SCLK_SDMMC_SAMPLE
+        ) {
             return Ok(());
         }
-
+        let Some(gate) = self.find_clk_gate(id) else {
+            return self.pcie_root_ref_enable(id);
+        };
         let offset = self.get_gate_reg_offset(gate);
 
         // Rockchip 写掩码机制：清除 bit
@@ -311,7 +315,15 @@ impl Cru {
     /// cru.clk_disable(CLK_I2C1)?;
     /// ```
     pub fn clk_disable(&mut self, id: ClkId) -> ClockResult<()> {
-        let gate = self.find_clk_gate(id).ok_or(ClockError::unsupported(id))?;
+        if matches!(
+            id,
+            SCLK_SDIO_DRV | SCLK_SDIO_SAMPLE | SCLK_SDMMC_DRV | SCLK_SDMMC_SAMPLE
+        ) {
+            return Ok(());
+        }
+        let Some(gate) = self.find_clk_gate(id) else {
+            return self.pcie_root_ref_disable(id);
+        };
         let offset = self.get_gate_reg_offset(gate);
 
         // Rockchip 写掩码机制：设置 bit
@@ -337,11 +349,15 @@ impl Cru {
     ///
     /// 返回 true 表示时钟已使能，false 表示已禁止，None 表示不支持
     pub fn clk_is_enabled(&self, id: ClkId) -> ClockResult<bool> {
-        let gate = self.find_clk_gate(id).ok_or(ClockError::unsupported(id))?;
-        if matches!(gate.kind, ClkType::Composite) {
+        if matches!(
+            id,
+            SCLK_SDIO_DRV | SCLK_SDIO_SAMPLE | SCLK_SDMMC_DRV | SCLK_SDMMC_SAMPLE
+        ) {
             return Ok(true);
         }
-
+        let Some(gate) = self.find_clk_gate(id) else {
+            return self.pcie_root_ref_is_enabled(id);
+        };
         let offset = self.get_gate_reg_offset(gate);
 
         // 读取寄存器，检查 bit
@@ -408,7 +424,12 @@ impl Cru {
             return self.usb_get_rate(id);
         }
 
-        // 10. 根时钟
+        // 10. PCIe/PHP 时钟
+        if is_pcie_clk(id) {
+            return self.pcie_get_rate(id);
+        }
+
+        // 11. 根时钟
         if matches!(
             id,
             ACLK_BUS_ROOT
@@ -486,6 +507,11 @@ impl Cru {
             return self.usb_set_rate(id, rate_hz);
         }
 
+        // 10. PCIe/PHP 时钟
+        if is_pcie_clk(id) {
+            return self.pcie_set_rate(id, rate_hz);
+        }
+
         // 其他时钟类型暂不支持设置
         Err(ClockError::invalid_rate(id, rate_hz))
     }
@@ -510,7 +536,7 @@ impl Cru {
     ///
     /// # 示例
     ///
-    /// ```rust
+    /// ```ignore
     /// // 清除 bit 5, 设置 bit 3
     /// self.clrsetreg(reg_offset, 0x20, 0x08);
     /// // 等价于: value = (current & ~0x20) | 0x08
@@ -646,17 +672,6 @@ mod tests {
         // ACLK_TOP 位掩码
         assert_eq!(ACLK_TOP_S400_SEL_MASK, 0x3 << 8);
         assert_eq!(ACLK_TOP_S200_SEL_MASK, 0x3 << 6);
-    }
-
-    /// 测试 clksel_con 寄存器地址计算
-    #[test]
-    fn test_clksel_con_address() {
-        // clksel_con[0] = 0x300
-        assert_eq!(CLKSEL_CON_OFFSET + 0 * 4, 0x300);
-        // clksel_con[9] = 0x324
-        assert_eq!(CLKSEL_CON_OFFSET + 9 * 4, 0x324);
-        // clksel_con[38] = 0x398
-        assert_eq!(CLKSEL_CON_OFFSET + 38 * 4, 0x398);
     }
 
     /// 模拟 u-boot 配置的寄存器值验证

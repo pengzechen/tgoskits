@@ -33,6 +33,16 @@ impl LockdepAcquire {
         Self
     }
 
+    #[inline(always)]
+    #[track_caller]
+    fn prepare_nested<G: BaseGuard, T: ?Sized>(
+        _lock: &BaseSpinLock<G, T>,
+        _is_try: bool,
+        _subclass: u32,
+    ) -> Self {
+        Self
+    }
+
     #[cfg(feature = "smp")]
     #[inline(always)]
     fn finish(&self, _acquired: bool) {}
@@ -62,8 +72,6 @@ pub struct BaseSpinLock<G: BaseGuard, T: ?Sized> {
 pub struct BaseSpinLockGuard<'a, G: BaseGuard, T: ?Sized + 'a> {
     _phantom: &'a PhantomData<G>,
     irq_state: G::State,
-    #[cfg(feature = "lockdep")]
-    lock_id: Option<u32>,
     #[cfg(feature = "lockdep")]
     lock_addr: usize,
     data: *mut T,
@@ -191,14 +199,23 @@ impl<G: BaseGuard, T: ?Sized> BaseSpinLock<G, T> {
     #[inline(always)]
     #[track_caller]
     pub fn lock(&self) -> BaseSpinLockGuard<'_, G, T> {
+        self.lock_nested(0)
+    }
+
+    /// Locks the [`BaseSpinLock`] using a lockdep subclass.
+    ///
+    /// This is intended for structurally nested acquisitions of different
+    /// locks with the same class. Without the `lockdep` feature it behaves the
+    /// same as [`Self::lock`].
+    #[inline(always)]
+    #[track_caller]
+    pub fn lock_nested(&self, subclass: u32) -> BaseSpinLockGuard<'_, G, T> {
         let irq_state = G::acquire();
-        let lockdep = LockdepAcquire::prepare(self, false);
+        let lockdep = LockdepAcquire::prepare_nested(self, false, subclass);
         self.blocking_acquire(lockdep);
         BaseSpinLockGuard {
             _phantom: &PhantomData,
             irq_state,
-            #[cfg(feature = "lockdep")]
-            lock_id: lockdep.lock_id(),
             #[cfg(feature = "lockdep")]
             lock_addr: lockdep.lock_addr(),
             data: unsafe { &mut *self.data.get() },
@@ -241,8 +258,6 @@ impl<G: BaseGuard, T: ?Sized> BaseSpinLock<G, T> {
                 _phantom: &PhantomData,
                 irq_state,
                 #[cfg(feature = "lockdep")]
-                lock_id: lockdep.lock_id(),
-                #[cfg(feature = "lockdep")]
                 lock_addr: lockdep.lock_addr(),
                 data: unsafe { &mut *self.data.get() },
                 #[cfg(feature = "smp")]
@@ -268,7 +283,7 @@ impl<G: BaseGuard, T: ?Sized> BaseSpinLock<G, T> {
         #[cfg(feature = "lockdep")]
         {
             let addr = self as *const _ as *const () as usize;
-            crate::lockdep::force_release::<G>(&self.lockdep, addr);
+            crate::lockdep::force_release::<G>(addr);
         }
         #[cfg(feature = "smp")]
         self.lock.store(false, Ordering::Release);
@@ -338,7 +353,7 @@ impl<G: BaseGuard, T: ?Sized> Drop for BaseSpinLockGuard<'_, G, T> {
             let _lockdep_irq_guard = IrqSave::new();
 
             #[cfg(feature = "lockdep")]
-            crate::lockdep::release::<G>(self.lock_id, self.lock_addr);
+            crate::lockdep::release::<G>(self.lock_addr);
             #[cfg(feature = "smp")]
             self.lock.store(false, Ordering::Release);
         }

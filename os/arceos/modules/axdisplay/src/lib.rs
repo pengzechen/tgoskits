@@ -4,26 +4,28 @@
 
 #![no_std]
 
-#[macro_use]
-extern crate log;
+extern crate alloc;
 
-#[doc(no_inline)]
-pub use ax_driver::prelude::DisplayInfo;
-use ax_driver::{AxDeviceContainer, prelude::*};
+mod device;
+pub mod rdif;
+mod types;
+
 use ax_lazyinit::LazyInit;
-use ax_sync::Mutex;
+use ax_sync::spin::SpinNoIrq as Mutex;
+pub use device::{DisplayDevice, DisplayError, DisplayResult, ErasedDisplayDevice};
+pub use types::{DisplayInfo, PixelFormat};
 
-static MAIN_DISPLAY: LazyInit<Mutex<AxDisplayDevice>> = LazyInit::new();
+static MAIN_DISPLAY: LazyInit<Mutex<ErasedDisplayDevice>> = LazyInit::new();
 
 /// Initializes the display subsystem by underlayer devices.
-pub fn init_display(mut display_devs: AxDeviceContainer<AxDisplayDevice>) {
-    info!("Initialize display subsystem...");
+pub fn init_display(display_devs: impl IntoIterator<Item = ErasedDisplayDevice>) {
+    log::info!("Initialize display subsystem...");
 
-    if let Some(dev) = display_devs.take_one() {
-        info!("  use display device 0: {:?}", dev.device_name());
+    if let Some(dev) = display_devs.into_iter().next() {
+        log::info!("  use display device 0: {}", dev.name());
         MAIN_DISPLAY.init_once(Mutex::new(dev));
     } else {
-        warn!("  No display device found!");
+        log::warn!("  No display device found!");
     }
 }
 
@@ -40,4 +42,25 @@ pub fn framebuffer_info() -> DisplayInfo {
 /// Flushes the framebuffer, i.e. show on the screen.
 pub fn framebuffer_flush() -> bool {
     MAIN_DISPLAY.lock().flush().is_ok()
+}
+
+/// Returns the resolved main display IRQ, if the runtime provided one.
+pub fn framebuffer_irq_id() -> Option<irq_framework::IrqId> {
+    MAIN_DISPLAY.lock().irq_id()
+}
+
+/// Enables IRQ handling in the main display driver.
+pub fn framebuffer_enable_irq() {
+    MAIN_DISPLAY.lock().enable_irq();
+}
+
+/// Disables IRQ handling in the main display driver.
+pub fn framebuffer_disable_irq() {
+    MAIN_DISPLAY.lock().disable_irq();
+}
+
+/// Acknowledges the main display IRQ source.
+pub fn framebuffer_handle_irq() -> bool {
+    let mut display = MAIN_DISPLAY.lock();
+    display.is_irq_enabled() && display.handle_irq()
 }

@@ -26,7 +26,7 @@ pub fn default_read_exact<R: Read + ?Sized>(this: &mut R, mut buf: &mut [u8]) ->
 }
 
 /// Default [`Read::read_buf`] implementation.
-pub fn default_read_buf<F>(read: F, mut cursor: BorrowedCursor<'_>) -> Result<()>
+pub fn default_read_buf<F>(read: F, mut cursor: BorrowedCursor<'_, u8>) -> Result<()>
 where
     F: FnOnce(&mut [u8]) -> Result<usize>,
 {
@@ -38,7 +38,7 @@ where
 /// Default [`Read::read_buf_exact`] implementation.
 pub fn default_read_buf_exact<R: Read + ?Sized>(
     this: &mut R,
-    mut cursor: BorrowedCursor<'_>,
+    mut cursor: BorrowedCursor<'_, u8>,
 ) -> Result<()> {
     while cursor.capacity() > 0 {
         let prev_written = cursor.written();
@@ -126,7 +126,7 @@ pub fn default_read_to_end<R: Read + ?Sized>(
         let mut spare = buf.spare_capacity_mut();
         let buf_len = spare.len().min(max_read_size);
         spare = &mut spare[..buf_len];
-        let mut read_buf: BorrowedBuf<'_> = spare.into();
+        let mut read_buf: BorrowedBuf<'_, u8> = spare.into();
 
         // Note that we don't track already initialized bytes here, but this is fine
         // because we explicitly limit the read size
@@ -245,14 +245,14 @@ pub trait Read {
     /// Pull some bytes from this source into the specified buffer.
     ///
     /// This method makes it possible to return both data and an error but it is advised against.
-    fn read_buf(&mut self, buf: BorrowedCursor<'_>) -> Result<()> {
+    fn read_buf(&mut self, buf: BorrowedCursor<'_, u8>) -> Result<()> {
         default_read_buf(|b| self.read(b), buf)
     }
 
     /// Reads the exact number of bytes required to fill `cursor`.
     ///
     /// If this function returns an error, all bytes read will be appended to `cursor`.
-    fn read_buf_exact(&mut self, cursor: BorrowedCursor<'_>) -> Result<()> {
+    fn read_buf_exact(&mut self, cursor: BorrowedCursor<'_, u8>) -> Result<()> {
         default_read_buf_exact(self, cursor)
     }
 
@@ -478,4 +478,254 @@ impl<B: BufRead> Iterator for Lines<B> {
             Err(e) => Some(Err(e)),
         }
     }
+}
+
+#[cfg(axtest)]
+pub(crate) fn read_default_read_exact_with_interrupt_hold_for_test() -> bool {
+    use crate::{Error, Read, default_read_exact};
+
+    // Test that Interrupted errors are retried
+    struct InterruptReader {
+        calls: usize,
+    }
+    impl Read for InterruptReader {
+        fn read(&mut self, buf: &mut [u8]) -> crate::Result<usize> {
+            self.calls += 1;
+            if self.calls <= 2 {
+                return Err(Error::Interrupted);
+            }
+            buf[0] = 42;
+            Ok(1)
+        }
+    }
+
+    let mut reader = InterruptReader { calls: 0 };
+    let mut buf = [0u8; 1];
+    let result = default_read_exact(&mut reader, &mut buf);
+    assert!(result.is_ok());
+    assert_eq!(buf[0], 42);
+
+    true
+}
+
+#[cfg(axtest)]
+pub(crate) fn read_take_struct_and_methods_hold_for_test() -> bool {
+    use crate::{Read, Take};
+
+    // Test Take struct wraps a reader with a limit
+    struct ExactReader;
+    impl Read for ExactReader {
+        fn read(&mut self, buf: &mut [u8]) -> crate::Result<usize> {
+            // Fill the buffer
+            for byte in buf.iter_mut() {
+                *byte = 0xAB;
+            }
+            Ok(buf.len())
+        }
+    }
+
+    let reader = ExactReader;
+    let mut take = Take::new(reader, 5);
+
+    // Test that limit is set correctly
+    assert_eq!(take.limit(), 5);
+
+    // Test reading less than limit
+    let mut buf = [0u8; 3];
+    let n = take.read(&mut buf).unwrap();
+    assert_eq!(n, 3);
+    assert_eq!(take.limit(), 2);
+
+    true
+}
+
+#[cfg(axtest)]
+pub(crate) fn read_default_read_exact_eof_hold_for_test() -> bool {
+    use crate::Read;
+
+    // Test that default_read_exact returns UnexpectedEof on EOF
+    struct EofReader;
+    impl Read for EofReader {
+        fn read(&mut self, _buf: &mut [u8]) -> crate::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    let mut reader = EofReader;
+    let mut buf = [0u8; 10];
+    let result = default_read_exact(&mut reader, &mut buf);
+    assert!(result.is_err());
+
+    true
+}
+
+#[cfg(axtest)]
+pub(crate) fn read_by_ref_and_chain_hold_for_test() -> bool {
+    use crate::{Chain, Read};
+
+    struct FirstReader {
+        data: [u8; 4],
+        pos: usize,
+    }
+    impl Read for FirstReader {
+        fn read(&mut self, buf: &mut [u8]) -> crate::Result<usize> {
+            let remaining = self.data.len() - self.pos;
+            let to_copy = remaining.min(buf.len());
+            if to_copy == 0 {
+                return Ok(0);
+            }
+            buf[..to_copy].copy_from_slice(&self.data[self.pos..self.pos + to_copy]);
+            self.pos += to_copy;
+            Ok(to_copy)
+        }
+    }
+
+    struct SecondReader {
+        data: [u8; 3],
+        pos: usize,
+    }
+    impl Read for SecondReader {
+        fn read(&mut self, buf: &mut [u8]) -> crate::Result<usize> {
+            let remaining = self.data.len() - self.pos;
+            let to_copy = remaining.min(buf.len());
+            if to_copy == 0 {
+                return Ok(0);
+            }
+            buf[..to_copy].copy_from_slice(&self.data[self.pos..self.pos + to_copy]);
+            self.pos += to_copy;
+            Ok(to_copy)
+        }
+    }
+
+    // Test by_ref returns a reference
+    let mut first = FirstReader {
+        data: [1, 2, 3, 4],
+        pos: 0,
+    };
+    let _ref = first.by_ref();
+    let mut buf = [0u8; 2];
+    let n = first.read(&mut buf).unwrap();
+    assert_eq!(n, 2);
+    assert_eq!(buf[0], 1);
+    assert_eq!(buf[1], 2);
+
+    // Test chain combines two readers
+    let first = FirstReader {
+        data: [1, 2, 3, 4],
+        pos: 0,
+    };
+    let second = SecondReader {
+        data: [5, 6, 7],
+        pos: 0,
+    };
+    let mut chained = Chain::new(first, second);
+    let mut buf = [0u8; 10];
+
+    // First read gets data from first reader
+    let n1 = chained.read(&mut buf).unwrap();
+    assert_eq!(n1, 4); // All 4 bytes from first reader
+
+    // Second read gets data from second reader (first returned 0)
+    let n2 = chained.read(&mut buf[4..]).unwrap();
+    assert_eq!(n2, 3); // All 3 bytes from second reader
+
+    assert_eq!(buf[..7], [1, 2, 3, 4, 5, 6, 7]);
+
+    true
+}
+
+#[cfg(axtest)]
+pub(crate) fn read_take_exhaustion_and_limit_hold_for_test() -> bool {
+    use crate::{Read, Take};
+
+    struct FixedReader {
+        data: [u8; 10],
+        pos: usize,
+    }
+    impl Read for FixedReader {
+        fn read(&mut self, buf: &mut [u8]) -> crate::Result<usize> {
+            let remaining = self.data.len() - self.pos;
+            let to_copy = remaining.min(buf.len());
+            if to_copy == 0 {
+                return Ok(0);
+            }
+            buf[..to_copy].copy_from_slice(&self.data[self.pos..self.pos + to_copy]);
+            self.pos += to_copy;
+            Ok(to_copy)
+        }
+    }
+
+    let reader = FixedReader {
+        data: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        pos: 0,
+    };
+    let mut take = Take::new(reader, 3);
+
+    // Read exactly the limit
+    let mut buf = [0u8; 5];
+    let n = take.read(&mut buf).unwrap();
+    assert_eq!(n, 3);
+    assert_eq!(take.limit(), 0);
+    assert_eq!(buf[..3], [0, 1, 2]);
+
+    // Next read should return 0 (exhausted)
+    let n2 = take.read(&mut buf).unwrap();
+    assert_eq!(n2, 0);
+
+    true
+}
+
+#[cfg(axtest)]
+pub(crate) fn read_bufread_has_data_left_and_skip_until_hold_for_test() -> bool {
+    use crate::{BufRead, Read};
+
+    struct BufferedReader {
+        data: [u8; 6],
+        pos: usize,
+    }
+    impl Read for BufferedReader {
+        fn read(&mut self, buf: &mut [u8]) -> crate::Result<usize> {
+            let remaining = self.data.len() - self.pos;
+            let to_copy = remaining.min(buf.len());
+            if to_copy == 0 {
+                return Ok(0);
+            }
+            buf[..to_copy].copy_from_slice(&self.data[self.pos..self.pos + to_copy]);
+            self.pos += to_copy;
+            Ok(to_copy)
+        }
+    }
+    impl BufRead for BufferedReader {
+        fn fill_buf(&mut self) -> crate::Result<&[u8]> {
+            if self.pos < self.data.len() {
+                Ok(&self.data[self.pos..])
+            } else {
+                Ok(&[])
+            }
+        }
+        fn consume(&mut self, amount: usize) {
+            self.pos += amount;
+        }
+    }
+
+    // Test has_data_left
+    let mut reader = BufferedReader {
+        data: [1, 2, 3, 4, 5, 6],
+        pos: 0,
+    };
+    assert!(reader.has_data_left().unwrap());
+
+    // Consume all data
+    reader.consume(6);
+    assert!(!reader.has_data_left().unwrap());
+
+    // Test skip_until
+    let mut reader2 = BufferedReader {
+        data: [1, 2, 0xFF, 4, 5, 6],
+        pos: 0,
+    };
+    let skipped = reader2.skip_until(0xFF).unwrap();
+    assert_eq!(skipped, 3); // 1, 2, 0xFF
+
+    true
 }

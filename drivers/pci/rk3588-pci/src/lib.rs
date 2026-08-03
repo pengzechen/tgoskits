@@ -17,7 +17,8 @@ const PCI_COMMAND_SERR: u32 = 1 << 8;
 const PCI_CLASS_BRIDGE_PCI: u32 = (0x06 << 24) | (0x04 << 16);
 
 const PCIE_CLIENT_GENERAL_CTRL: usize = 0x000;
-const PCIE_CLIENT_INTR_MASK: usize = 0x024;
+const PCIE_CLIENT_INTR_MASK_LEGACY: usize = 0x01c;
+const PCIE_CLIENT_INTR_MASK_MISC: usize = 0x024;
 const PCIE_CLIENT_POWER: usize = 0x02c;
 const PCIE_CLIENT_GENERAL_DEBUG: usize = 0x104;
 const PCIE_CLIENT_HOT_RESET_CTRL: usize = 0x180;
@@ -25,6 +26,7 @@ const PCIE_CLIENT_LTSSM_STATUS: usize = 0x300;
 const PCIE_LTSSM_APP_DLY2_EN: u32 = 1 << 1;
 const PCIE_LTSSM_ENABLE_ENHANCE: u32 = 1 << 4;
 const PCIE_CLIENT_RESET_MASK: u32 = 1 << 18;
+const PCIE_LEGACY_INTX_MASK: u32 = 0x0f;
 
 const PCIE_PORT_DEBUG1: usize = 0x72c;
 const PCIE_PORT_DEBUG1_LINK_UP: u32 = 1 << 4;
@@ -98,6 +100,7 @@ pub struct HostConfig {
     pub cfg_size: usize,
     pub bus_base: u8,
     pub logical_bus_end: u8,
+    pub iatu_mode: IatuMode,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -147,19 +150,8 @@ pub struct Rk3588PcieHost {
 }
 
 impl Rk3588PcieHost {
-    pub fn new(
-        apb: MmioRaw,
-        dbi: MmioRaw,
-        cfg: MmioRaw,
-        config: HostConfig,
-    ) -> Result<Self, Error> {
-        let iatu_mode = if read32(&dbi, PCIE_ATU_VIEWPORT) == u32::MAX {
-            IatuMode::Unroll
-        } else {
-            IatuMode::Viewport
-        };
-
-        Ok(Self {
+    pub fn new(apb: MmioRaw, dbi: MmioRaw, cfg: MmioRaw, config: HostConfig) -> Self {
+        Self {
             apb,
             dbi,
             cfg,
@@ -169,8 +161,8 @@ impl Rk3588PcieHost {
             bus_base: config.bus_base,
             logical_bus_end: config.logical_bus_end,
             cfg_bus_delta: i16::from(config.bus_base),
-            iatu_mode,
-        })
+            iatu_mode: config.iatu_mode,
+        }
     }
 
     pub fn init(
@@ -178,8 +170,8 @@ impl Rk3588PcieHost {
         delay: &dyn Delay,
         mut reset: Option<&mut dyn ResetControl>,
     ) -> LinkReport {
-        self.enable_dbi_ro_writes();
         self.force_root_complex_mode();
+        self.enable_dbi_ro_writes();
         self.program_root_bridge_defaults();
 
         let firmware_trained = self.link_up();
@@ -202,7 +194,11 @@ impl Rk3588PcieHost {
 
         write32(&self.apb, PCIE_CLIENT_GENERAL_CTRL, 0x000c_0008);
         write32(&self.apb, PCIE_CLIENT_GENERAL_DEBUG, 0);
-        write32(&self.apb, PCIE_CLIENT_INTR_MASK, PCIE_CLIENT_RESET_MASK);
+        write32(
+            &self.apb,
+            PCIE_CLIENT_INTR_MASK_MISC,
+            PCIE_CLIENT_RESET_MASK,
+        );
 
         update32(&self.apb, PCIE_CLIENT_HOT_RESET_CTRL, |value| {
             let bits = PCIE_LTSSM_ENABLE_ENHANCE | PCIE_LTSSM_APP_DLY2_EN;
@@ -268,6 +264,14 @@ impl Rk3588PcieHost {
             window.pci_base,
             window.size,
         )
+    }
+
+    pub fn unmask_legacy_intx_all(&self) {
+        write32(
+            &self.apb,
+            PCIE_CLIENT_INTR_MASK_LEGACY,
+            PCIE_LEGACY_INTX_MASK << 16,
+        );
     }
 
     pub fn direct_endpoint_info(&self) -> Option<EndpointInfo> {

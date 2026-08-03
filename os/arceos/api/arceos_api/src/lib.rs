@@ -22,7 +22,8 @@ pub use ax_errno::{AxError, AxResult};
 
 /// Platform-specific constants and parameters.
 pub mod config {
-    pub use ax_config::*;
+    /// Stack size used when callers do not provide an explicit task stack.
+    pub const TASK_STACK_SIZE: usize = 0x40000;
 }
 
 /// System operations.
@@ -74,32 +75,6 @@ pub mod mem {
         /// the buffer life cycle.
         pub unsafe fn ax_dealloc(ptr: NonNull<u8>, layout: Layout);
     }
-
-    define_api_type! {
-        @cfg "dma";
-        pub type DMAInfo;
-    }
-
-    define_api! {
-        @cfg "dma";
-        /// Allocates **coherent** memory that meets Direct Memory Access (DMA)
-        /// requirements.
-        ///
-        /// Returns [`None`] if the allocation fails.
-        ///
-        /// # Safety
-        ///
-        /// This function is unsafe because it requires users to manually manage
-        /// the buffer life cycle.
-        pub unsafe fn ax_alloc_coherent(layout: Layout) -> Option<DMAInfo>;
-        /// Deallocates coherent memory previously allocated.
-        ///
-        /// # Safety
-        ///
-        /// This function is unsafe because it requires users to manually manage
-        /// the buffer life cycle.
-        pub unsafe fn ax_dealloc_coherent(dma: DMAInfo, layout: Layout);
-    }
 }
 
 /// Standard input and output.
@@ -126,18 +101,21 @@ pub mod task {
     }
 
     define_api! {
-        /// Current task is going to sleep, it will be woken up at the given deadline.
+        /// Current task is going to sleep, it will be woken up at the given monotonic deadline.
         ///
         /// If the feature `multitask` is not enabled, it uses busy-wait instead
+        #[track_caller]
         pub fn ax_sleep_until(deadline: crate::time::AxTimeValue);
 
         /// Current task gives up the CPU time voluntarily, and switches to another
         /// ready task.
         ///
         /// If the feature `multitask` is not enabled, it does nothing.
+        #[track_caller]
         pub fn ax_yield_now();
 
         /// Exits the current task with the given exit code.
+        #[track_caller]
         pub fn ax_exit(exit_code: i32) -> !;
     }
 
@@ -154,18 +132,22 @@ pub mod task {
         ) -> AxTaskHandle;
         /// Waits for the given task to exit, and returns its exit code (the
         /// argument of [`ax_exit`]).
+        #[track_caller]
         pub fn ax_wait_for_exit(task: AxTaskHandle) -> i32;
         /// Sets the priority of the current task.
         pub fn ax_set_current_priority(prio: isize) -> crate::AxResult;
         /// Sets the cpu affinity of the current task.
+        #[track_caller]
         pub fn ax_set_current_affinity(cpumask: AxCpuMask) -> crate::AxResult;
         /// Blocks the current task and put it into the wait queue, until
         /// other tasks notify the wait queue, or the given duration has
         /// elapsed (if specified).
+        #[track_caller]
         pub fn ax_wait_queue_wait(wq: &AxWaitQueueHandle, timeout: Option<core::time::Duration>) -> bool;
         /// Blocks the current task and put it into the wait queue, until the
         /// given condition becomes true, or the given duration has elapsed
         /// (if specified).
+        #[track_caller]
         pub fn ax_wait_queue_wait_until(
             wq: &AxWaitQueueHandle,
             until_condition: impl Fn() -> bool,
@@ -197,7 +179,9 @@ pub mod fs {
         pub type AxOpenOptions;
         pub type AxFileAttr;
         pub type AxFileType;
+        pub type AxFileTypeExt;
         pub type AxFilePerm;
+        pub type AxFilePermExt;
         pub type AxDirEntry;
         pub type AxSeekFrom;
     }
@@ -393,15 +377,10 @@ pub mod io {
 pub mod modules {
     #[cfg(feature = "alloc")]
     pub use ax_alloc;
-    pub use ax_config;
     #[cfg(feature = "display")]
     pub use ax_display;
-    #[cfg(feature = "dma")]
-    pub use ax_dma;
-    #[cfg(any(feature = "fs", feature = "net", feature = "display"))]
-    pub use ax_driver;
     #[cfg(feature = "fs")]
-    pub use ax_fs;
+    pub use ax_fs_ng;
     pub use ax_hal;
     #[cfg(feature = "ipi")]
     pub use ax_ipi;
@@ -414,4 +393,6 @@ pub mod modules {
     pub use ax_sync;
     #[cfg(feature = "multitask")]
     pub use ax_task;
+    pub use axklib;
+    pub use dma_api;
 }

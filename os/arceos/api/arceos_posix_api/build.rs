@@ -29,7 +29,7 @@ fn main() {
         }
     }
 
-    fn gen_pthread_mutex(out_file: &str) -> std::io::Result<()> {
+    fn gen_pthread_mutex(out_file: &std::path::Path) -> std::io::Result<()> {
         println!("cargo:rerun-if-env-changed=CARGO_FEATURE_MULTITASK");
         println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SMP");
         println!("cargo:rerun-if-env-changed=CARGO_FEATURE_LOCKDEP");
@@ -57,7 +57,11 @@ typedef struct {{
         Ok(())
     }
 
-    fn gen_c_to_rust_bindings(in_file: &str, out_file: &std::path::Path) {
+    fn gen_c_to_rust_bindings(
+        in_file: &str,
+        generated_include_dir: &std::path::Path,
+        out_file: &std::path::Path,
+    ) {
         println!("cargo:rerun-if-changed={in_file}");
 
         let allow_types = [
@@ -78,6 +82,8 @@ typedef struct {{
             "clockid_t",
             "rlimit",
             "aibuf",
+            "pollfd",
+            "nfds_t",
         ];
 
         let allow_vars = [
@@ -94,6 +100,10 @@ typedef struct {{
             "RLIMIT_.*",
             "EAI_.*",
             "MAXADDRS",
+            "SO_.*",
+            "SOL_.*",
+            "TCP_.*",
+            "POLL.*",
         ];
 
         #[derive(Debug)]
@@ -110,11 +120,18 @@ typedef struct {{
         let target = std::env::var("TARGET").unwrap();
         let mut builder = bindgen::Builder::default()
             .header(in_file)
+            .clang_arg(format!("-I{}", generated_include_dir.display()))
             .clang_arg("-I./../../ulib/axlibc/include")
             .parse_callbacks(Box::new(MyCallbacks))
             .derive_default(true)
             .size_t_is_usize(false)
             .use_core();
+        for feature in ["MULTITASK", "SMP", "LOCKDEP", "PLAT_DYN"] {
+            println!("cargo:rerun-if-env-changed=CARGO_FEATURE_{feature}");
+            if std::env::var_os(format!("CARGO_FEATURE_{feature}")).is_some() {
+                builder = builder.clang_arg(format!("-DAX_CONFIG_{feature}"));
+            }
+        }
 
         // Remove the "-softfloat" suffix for some targets.
         if let Some(llvm_target) = target.strip_suffix("-softfloat") {
@@ -140,8 +157,8 @@ typedef struct {{
     let out_dir = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
     let out_file = out_dir.join("ctypes_gen.rs");
     if axlibc_include.exists() {
-        gen_pthread_mutex(axlibc_include.join("ax_pthread_mutex.h").to_str().unwrap()).unwrap();
-        gen_c_to_rust_bindings("ctypes.h", &out_file);
+        gen_pthread_mutex(&out_dir.join("ax_pthread_mutex.h")).unwrap();
+        gen_c_to_rust_bindings("ctypes.h", &out_dir, &out_file);
     } else {
         // During `cargo publish` verification, the external headers are not
         // available. Use the pre-generated ctypes_gen.rs shipped in the crate.

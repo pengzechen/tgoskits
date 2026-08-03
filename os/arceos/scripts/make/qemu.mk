@@ -15,11 +15,7 @@ ifeq ($(ARCH), x86_64)
 else ifeq ($(ARCH), riscv64)
   machine := virt
 else ifeq ($(ARCH), aarch64)
-  ifeq ($(PLAT_NAME), aarch64-raspi4)
-    machine := raspi4b
-  else
-    machine := virt
-  endif
+  machine := virt
 else ifeq ($(ARCH), loongarch64)
   machine := virt
 endif
@@ -45,7 +41,7 @@ qemu_args-loongarch64 := \
 qemu_args-y := -m $(MEM) -smp $(SMP) $(qemu_args-$(ARCH))
 
 qemu_args-$(BLK) += \
-  -device virtio-blk-$(vdev-suffix),drive=disk0 \
+  -device nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65 \
   -drive id=disk0,if=none,format=raw,file=$(DISK_IMG)
 
 qemu_args-$(NET) += \

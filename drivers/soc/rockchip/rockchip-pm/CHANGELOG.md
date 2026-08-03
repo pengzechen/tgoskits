@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.7](https://github.com/rcore-os/tgoskits/compare/rockchip-pm-v0.4.6...rockchip-pm-v0.4.7) - 2026-08-03
+
+### Added
+
+- *(rockchip)* add RK3576 ROCK 4D support ([#1704](https://github.com/rcore-os/tgoskits/pull/1704))
+
+## [0.4.6](https://github.com/rcore-os/tgoskits/compare/rockchip-pm-v0.4.5...rockchip-pm-v0.4.6) - 2026-07-07
+
+### Added
+
+- *(rdrive)* add FDT power-domain probing ([#1515](https://github.com/rcore-os/tgoskits/pull/1515))
+
+## [0.4.5](https://github.com/rcore-os/tgoskits/compare/rockchip-pm-v0.4.4...rockchip-pm-v0.4.5) - 2026-06-12
+
+### Other
+
+- updated the following local packages: rdif-base
+
+## [0.4.4](https://github.com/rcore-os/tgoskits/compare/rockchip-pm-v0.4.3...rockchip-pm-v0.4.4) - 2026-06-09
+
+### Other
+
+- updated the following local packages: rdif-base
+
+## [0.4.3](https://github.com/rcore-os/tgoskits/compare/rockchip-pm-v0.4.2...rockchip-pm-v0.4.3) - 2026-05-15
+
+### Added
+
+- *(drivers)* migrate Sparreal driver crates ([#540](https://github.com/rcore-os/tgoskits/pull/540))
+
+### Other
+
+- 添加 sparreal-os 组件的 GitHub 仓库链接
+- *(rockchip-soc)* inherit workspace metadata
+
 ## [0.4.0] - 2025-01-28
 
 ### Added

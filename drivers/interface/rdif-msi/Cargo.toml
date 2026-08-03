@@ -1,0 +1,21 @@
+[package]
+authors.workspace = true
+categories = ["embedded", "no-std"]
+description = "Driver Interface for message-signaled interrupt providers."
+edition.workspace = true
+keywords = ["os", "driver", "msi"]
+license.workspace = true
+name = "rdif-msi"
+repository.workspace = true
+version = "0.2.1"
+
+[dependencies]
+axtest = { workspace = true, optional = true }
+irq-framework = { workspace = true }
+rdif-base = { workspace = true }
+
+[features]
+axtest = ["dep:axtest"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(axtest)'] }

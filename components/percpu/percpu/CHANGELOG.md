@@ -1,0 +1,56 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.4.16](https://github.com/rcore-os/tgoskits/compare/ax-percpu-v0.4.15...ax-percpu-v0.4.16) - 2026-08-03
+
+### Other
+
+- updated the following local packages: cpu-local, ax-lazyinit
+
+## [0.4.15](https://github.com/rcore-os/tgoskits/compare/ax-percpu-v0.4.14...ax-percpu-v0.4.15) - 2026-07-23
+
+### Other
+
+- *(cpu-local)* extract per-CPU register ownership ([#1662](https://github.com/rcore-os/tgoskits/pull/1662))
+
+### Changed
+
+- Use dynamically allocated CPU areas exclusively; the ELF now retains one typed template and
+  platforms initialize every runtime area before binding a CPU.
+
+### Removed
+
+- Remove the linked/static storage modes and all compatibility features except `host-test`.
+- Remove the former prefixed/legacy linker sections, symbols, C ABI exports, and linked-layout
+  Rust entry points. The supported contract is `.percpu.template`, `.percpu.init`,
+  `.percpu.align`, `__PERCPU_*`, `__CPU_LOCAL_*`, and the neutral `__percpu_*` initialization ABI.
+
+## [0.4.14](https://github.com/rcore-os/tgoskits/compare/ax-percpu-v0.4.13...ax-percpu-v0.4.14) - 2026-07-07
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.4.13](https://github.com/rcore-os/tgoskits/compare/ax-percpu-v0.4.12...ax-percpu-v0.4.13) - 2026-06-09
+
+### Added
+
+- *(std)* unify std-aware ArceOS builds ([#1080](https://github.com/rcore-os/tgoskits/pull/1080))
+
+## [0.4.12](https://github.com/rcore-os/tgoskits/compare/ax-percpu-v0.4.11...ax-percpu-v0.4.12) - 2026-06-03
+
+### Other
+
+- *(deps)* update spin 0.10→0.12, ostool 0.19→0.21 ([#978](https://github.com/rcore-os/tgoskits/pull/978))
+
+## [0.4.11](https://github.com/rcore-os/tgoskits/compare/ax-percpu-v0.4.10...ax-percpu-v0.4.11) - 2026-05-15
+
+### Other
+
+- updated the following local packages: ax-kernel-guard

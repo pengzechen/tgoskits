@@ -3,7 +3,14 @@
 use core::arch::asm;
 
 use ax_memory_addr::{PhysAddr, VirtAddr};
-use loongArch64::register::{crmd, ecfg, eentry, pgdh, pgdl};
+use loongArch64::register::{
+    crmd,
+    ecfg::{self, LineBasedInterrupt},
+    eentry, pgdh, pgdl,
+};
+
+#[cfg(feature = "tls")]
+use crate::KernelTlsBase;
 
 /// Allows the current CPU to respond to interrupts.
 #[inline]
@@ -23,12 +30,30 @@ pub fn irqs_enabled() -> bool {
     crmd::read().ie()
 }
 
+/// Enables or disables the local timer interrupt line.
+#[inline]
+pub fn set_timer_irq_enabled(enabled: bool) {
+    set_local_irq_line_enabled(LineBasedInterrupt::TIMER, enabled)
+}
+
+/// Enables or disables a local interrupt line.
+#[inline]
+fn set_local_irq_line_enabled(line: LineBasedInterrupt, enabled: bool) {
+    let current = ecfg::read().lie();
+    let new_value = if enabled {
+        current | line
+    } else {
+        current & !line
+    };
+    ecfg::set_lie(new_value);
+}
+
 /// Relaxes the current CPU and waits for interrupts.
 ///
 /// It must be called with interrupts enabled, otherwise it will never return.
 #[inline]
 pub fn wait_for_irqs() {
-    unsafe { loongArch64::asm::idle() }
+    unsafe { asm!("idle 0", options(nomem, nostack)) }
 }
 
 /// Halt the current CPU.
@@ -76,6 +101,13 @@ pub unsafe fn write_user_page_table(root_paddr: PhysAddr) {
 /// This function is unsafe as it changes the virtual memory address space.
 pub unsafe fn write_kernel_page_table(root_paddr: PhysAddr) {
     pgdh::set_base(root_paddr.as_usize());
+}
+
+/// Flushes the entire instruction cache.
+/// See <https://elixir.bootlin.com/linux/v6.6/source/arch/loongarch/mm/cache.c#L38>
+#[inline]
+pub fn flush_icache_all() {
+    unsafe { asm!("ibar 0") };
 }
 
 /// Flushes the TLB.
@@ -149,26 +181,32 @@ pub unsafe fn write_pwc(pwcl: u32, pwch: u32) {
     }
 }
 
-/// Reads the thread pointer of the current CPU (`$tp`).
+/// Reads the current kernel task's TLS base from `$tp`.
 ///
-/// It is used to implement TLS (Thread Local Storage).
+/// This register follows the execution context across CPUs. It is distinct
+/// from the CPU-local base kept in `$r21`.
 #[inline]
-pub fn read_thread_pointer() -> usize {
-    let tp;
-    unsafe { asm!("move {}, $tp", out(reg) tp) };
-    tp
+#[cfg(feature = "tls")]
+pub fn read_thread_pointer() -> KernelTlsBase {
+    let address;
+    unsafe { asm!("move {}, $tp", out(reg) address) };
+    KernelTlsBase::new(address)
 }
 
-/// Writes the thread pointer of the current CPU (`$tp`).
+/// Writes the current kernel task's TLS base to `$tp`.
 ///
-/// It is used to implement TLS (Thread Local Storage).
+/// This register follows the execution context across CPUs. It is distinct
+/// from the CPU-local base kept in `$r21`.
 ///
 /// # Safety
 ///
-/// This function is unsafe as it changes the CPU states.
+/// The caller must ensure `kernel_tls` belongs to the execution context that
+/// is becoming current and that no Rust code observes a half-completed context
+/// switch.
 #[inline]
-pub unsafe fn write_thread_pointer(tp: usize) {
-    unsafe { asm!("move $tp, {}", in(reg) tp) }
+#[cfg(feature = "tls")]
+pub unsafe fn write_thread_pointer(kernel_tls: KernelTlsBase) {
+    unsafe { asm!("move $tp, {}", in(reg) kernel_tls.as_usize()) }
 }
 
 /// Enables floating-point instructions by setting `EUEN.FPE`.
@@ -184,6 +222,13 @@ pub fn enable_fp() {
 /// - `EUEN`: <https://loongson.github.io/LoongArch-Documentation/LoongArch-Vol1-EN.html#extended-component-unit-enable>
 pub fn enable_lsx() {
     loongArch64::register::euen::set_sxe(true);
+}
+
+/// Enables LASX extension by setting `EUEN.ASXE`.
+///
+/// - `EUEN`: <https://loongson.github.io/LoongArch-Documentation/LoongArch-Vol1-EN.html#extended-component-unit-enable>
+pub fn enable_lasx() {
+    loongArch64::register::euen::set_asxe(true);
 }
 
 #[cfg(feature = "uspace")]

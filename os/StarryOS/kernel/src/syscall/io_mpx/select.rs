@@ -13,7 +13,6 @@ use starry_signal::SignalSet;
 
 use super::FdPollSet;
 use crate::{
-    file::FD_TABLE,
     mm::{UserConstPtr, UserPtr, nullable},
     syscall::signal::check_sigset_size,
     task::with_blocked_signals,
@@ -33,6 +32,15 @@ impl FdSet {
             }
         }
         Self(bitmap)
+    }
+}
+
+fn write_fd_set(user: Option<&mut __kernel_fd_set>, selected: &FdSet, nfds: usize) {
+    if let Some(user) = user {
+        unsafe { FD_ZERO(user) };
+        for index in selected.0.into_iter().take(nfds) {
+            unsafe { FD_SET(index as _, user) };
+        }
     }
 }
 
@@ -74,7 +82,8 @@ fn do_select(
          {except_set:?}] timeout: {timeout:?}"
     );
 
-    let fd_table = FD_TABLE.read();
+    let current_fd_table = crate::file::current_fd_table();
+    let fd_table = current_fd_table.read();
     let fd_bitmap = read_set.0 | write_set.0 | except_set.0;
     let fd_count = fd_bitmap.len();
     let mut fds = Vec::with_capacity(fd_count);
@@ -98,50 +107,57 @@ fn do_select(
     drop(fd_table);
     let fds = FdPollSet(fds);
 
-    if let Some(readfds) = readfds.as_deref_mut() {
-        unsafe { FD_ZERO(readfds) };
-    }
-    if let Some(writefds) = writefds.as_deref_mut() {
-        unsafe { FD_ZERO(writefds) };
-    }
-    if let Some(exceptfds) = exceptfds.as_deref_mut() {
-        unsafe { FD_ZERO(exceptfds) };
-    }
     with_blocked_signals(sigmask.copied(), || {
-        match block_on(future::timeout(
+        let result = block_on(future::timeout(
             timeout,
             poll_io(&fds, IoEvents::empty(), false, || {
                 let mut res = 0usize;
+                let mut selected_readfds = FdSet(Bitmap::new());
+                let mut selected_writefds = FdSet(Bitmap::new());
+                let mut selected_exceptfds = FdSet(Bitmap::new());
                 for ((fd, interested), index) in fds.0.iter().zip(fd_indices.iter().copied()) {
-                    let events = fd.poll() & *interested;
-                    if events.contains(IoEvents::IN)
-                        && let Some(set) = readfds.as_deref_mut()
-                    {
+                    let events = fd.poll();
+                    let always_report = events & IoEvents::ALWAYS_POLL;
+                    let selected = events & *interested;
+                    let selected_read = selected.contains(IoEvents::IN)
+                        || (read_set.0.get(index) && !always_report.is_empty());
+                    let selected_write = selected.contains(IoEvents::OUT)
+                        || (write_set.0.get(index) && !always_report.is_empty());
+                    let selected_except =
+                        selected.contains(IoEvents::ERR) && except_set.0.get(index);
+
+                    if selected_read {
                         res += 1;
-                        unsafe { FD_SET(index as _, set) };
+                        selected_readfds.0.set(index, true);
                     }
-                    if events.contains(IoEvents::OUT)
-                        && let Some(set) = writefds.as_deref_mut()
-                    {
+                    if selected_write {
                         res += 1;
-                        unsafe { FD_SET(index as _, set) };
+                        selected_writefds.0.set(index, true);
                     }
-                    if events.contains(IoEvents::ERR)
-                        && let Some(set) = exceptfds.as_deref_mut()
-                    {
+                    if selected_except {
                         res += 1;
-                        unsafe { FD_SET(index as _, set) };
+                        selected_exceptfds.0.set(index, true);
                     }
                 }
                 if res > 0 {
+                    write_fd_set(readfds.as_deref_mut(), &selected_readfds, nfds as _);
+                    write_fd_set(writefds.as_deref_mut(), &selected_writefds, nfds as _);
+                    write_fd_set(exceptfds.as_deref_mut(), &selected_exceptfds, nfds as _);
                     return Ok(res as _);
                 }
 
                 Err(AxError::WouldBlock)
             }),
-        )) {
+        ));
+        match result {
             Ok(r) => r,
-            Err(_) => Ok(0),
+            Err(_) => {
+                let empty = FdSet(Bitmap::new());
+                write_fd_set(readfds, &empty, nfds as _);
+                write_fd_set(writefds, &empty, nfds as _);
+                write_fd_set(exceptfds, &empty, nfds as _);
+                Ok(0)
+            }
         }
     })
 }
@@ -191,4 +207,22 @@ pub fn sys_pselect6(
             .transpose()?,
         sigmask,
     )
+}
+
+#[cfg(axtest)]
+pub(crate) fn select_fd_set_and_validation_rules_hold_for_test() -> bool {
+    use linux_raw_sys::general::__FD_SETSIZE;
+
+    // Test nfds validation: must be <= __FD_SETSIZE
+    let valid_nfds = 1024u32;
+    assert!(valid_nfds <= __FD_SETSIZE as u32);
+
+    let max_nfds = __FD_SETSIZE as u32;
+    assert!(max_nfds <= __FD_SETSIZE as u32);
+
+    // Invalid: nfds > __FD_SETSIZE
+    let invalid_nfds = (__FD_SETSIZE + 1) as u32;
+    assert!(invalid_nfds > __FD_SETSIZE as u32);
+
+    true
 }

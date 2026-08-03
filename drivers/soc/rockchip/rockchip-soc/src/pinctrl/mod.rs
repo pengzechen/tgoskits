@@ -53,6 +53,10 @@ pub type PinctrlResult<T> = core::result::Result<T, PinctrlError>;
 pub trait PinCtrlOp {
     fn set_config(&mut self, config: PinConfig) -> PinctrlResult<()>;
 
+    fn set_pull(&mut self, pin: PinId, pull: Pull) -> PinctrlResult<()>;
+
+    fn set_drive(&mut self, pin: PinId, drive: u32) -> PinctrlResult<()>;
+
     fn get_config(&self, pin: PinId) -> PinctrlResult<PinConfig>;
 
     fn gpio_direction(&self, pin: PinId) -> PinctrlResult<GpioDirection>;
@@ -74,6 +78,7 @@ pub trait PinCtrlOp {
 
 #[enum_dispatch::enum_dispatch(PinCtrlOp)]
 pub enum PinCtrl {
+    Rk3576(crate::variants::rk3576::PinCtrl),
     Rk3588(crate::variants::rk3588::PinCtrl),
 }
 
@@ -81,6 +86,37 @@ impl PinCtrl {
     pub fn new(ty: SocType, ioc: Mmio, gpio: &[Mmio]) -> Self {
         match ty {
             SocType::Rk3588 => PinCtrl::Rk3588(crate::variants::rk3588::PinCtrl::new(ioc, gpio)),
+            SocType::Rk3576 => {
+                PinCtrl::Rk3576(crate::variants::rk3576::PinCtrl::new(ioc, None, gpio))
+            }
+            SocType::Rk3568 => panic!("RK3568 pinctrl is not implemented"),
         }
+    }
+
+    pub fn new_rk3576(ioc: Mmio, sys_grf: Option<Mmio>, gpio: &[Mmio]) -> Self {
+        Self::Rk3576(crate::variants::rk3576::PinCtrl::new(ioc, sys_grf, gpio))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PinCtrl;
+    use crate::{Mmio, SocType};
+
+    fn mmio(words: &mut [u32]) -> Mmio {
+        core::ptr::NonNull::new(words.as_mut_ptr().cast()).unwrap()
+    }
+
+    #[test]
+    fn constructs_rk3576_pinctrl_backend() {
+        let mut ioc = std::vec![0_u32; (0xb398 + 4) / 4];
+        let mut gpio_memory: std::vec::Vec<std::vec::Vec<u32>> =
+            (0..5).map(|_| std::vec![0_u32; 0x200 / 4]).collect();
+        let gpio_banks: std::vec::Vec<Mmio> =
+            gpio_memory.iter_mut().map(|bank| mmio(bank)).collect();
+
+        let pinctrl = PinCtrl::new(SocType::Rk3576, mmio(&mut ioc), &gpio_banks);
+
+        assert!(matches!(pinctrl, PinCtrl::Rk3576(_)));
     }
 }

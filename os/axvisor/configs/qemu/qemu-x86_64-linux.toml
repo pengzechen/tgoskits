@@ -1,0 +1,26 @@
+args = [
+  "-nodefaults",
+  "-no-user-config",
+  "-display",
+  "none",
+  "-serial",
+  "mon:stdio",
+  "-cpu",
+  "host",
+  "-machine",
+  "q35,sata=off,smbus=off,i8042=off,usb=off,graphics=off",
+  "-smp",
+  "1",
+  "-accel",
+  "kvm",
+  "-device",
+  "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65,addr=03.0",
+  "-drive",
+  "id=disk0,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-alpine.img",
+  "-m",
+  "512M",
+]
+fail_regex = []
+success_regex = []
+to_bin = true
+uefi = true
