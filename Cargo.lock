@@ -1137,6 +1137,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ax-rt"
+version = "0.1.0"
+dependencies = [
+ "ax-cpu",
+ "ax-memory-addr",
+ "cpu-local",
+]
+
+[[package]]
 name = "ax-runtime"
 version = "0.11.0"
 dependencies = [
@@ -1576,6 +1585,7 @@ dependencies = [
  "ax-hal",
  "ax-log",
  "ax-memory-addr",
+ "ax-rt",
  "ax-std",
  "axbacktrace",
  "axbuild",
