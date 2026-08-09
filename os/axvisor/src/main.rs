@@ -140,6 +140,7 @@ fn main() {
 
     #[cfg(not(feature = "no-auto-start"))]
     info!("[OK] Default guest initialized");
+    realtime::setup_host_mailbox_doorbell();
     realtime::log_priority_test_result();
 
     // The management console runs on the primary CPU (Core 0) while the vCPU
