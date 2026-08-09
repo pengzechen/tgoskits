@@ -140,8 +140,8 @@ fn main() {
 
     #[cfg(not(feature = "no-auto-start"))]
     info!("[OK] Default guest initialized");
-    realtime::setup_host_mailbox_doorbell();
-    realtime::log_priority_test_result();
+    ax_realtime::setup_host_side();
+    realtime::run_rt_selftests();
 
     // The management console runs on the primary CPU (Core 0) while the vCPU
     // tasks are pinned to Core 1 via `phys_cpu_ids`, so it stays responsive
