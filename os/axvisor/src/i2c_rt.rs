@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Reserved-core (core 7) I2C control for an LU9685 servo controller on the
+//! Reserved-core (core 7) I2C control for header-connected devices on the
 //! OrangePi-5-Plus 40-pin header.
 //!
 //! Target bus: **I2C5 (`0xfead_0000`)**, muxed to function group **m3** on
@@ -37,9 +37,9 @@
 //!    open-drain lines would otherwise float).
 //!
 //! The rk3x polling master is inlined from `ax-driver`'s `pmic_i2c` (same IP
-//! block, `rockchip,rk3588-i2c`), retargeted to I2C5. The RT task writes the
-//! LU9685 I2C protocol used by the ESP32 reference program: two data bytes,
-//! `channel` and `angle`, to 7-bit address `0x00`.
+//! block, `rockchip,rk3588-i2c`), retargeted to I2C5. Feature-gated RT tasks use
+//! it for the ESP32-reference protocols: LU9685 servo writes (`channel`, `angle`)
+//! and MPU6050 register reads from `ACCEL_XOUT_H`.
 //!
 //! # Address-space handshake
 //!
@@ -52,7 +52,7 @@
 
 use core::{
     ptr::NonNull,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::Duration,
 };
 
@@ -163,6 +163,7 @@ const GPIO1_B6_BIT: u32 = 14;
 /// with `Acquire` from the RT core; the zero sentinel closes the boot-order race
 /// (the RT task may start before the host finishes mapping).
 static I2C5_VIRT: AtomicUsize = AtomicUsize::new(0);
+static I2C5_RT_BUSY: AtomicBool = AtomicBool::new(false);
 
 const I2C5_BUS: I2cBusConfig = I2cBusConfig {
     name: "I2C5",
@@ -177,25 +178,42 @@ const I2C5_BUS: I2cBusConfig = I2cBusConfig {
 
 const REG_CON: usize = 0x00; // control
 const REG_CLKDIV: usize = 0x04; // clock divider
+#[cfg(feature = "rt-mpu6050")]
+const REG_MRXADDR: usize = 0x08; // master-rx slave address
+#[cfg(feature = "rt-mpu6050")]
+const REG_MRXRADDR: usize = 0x0c; // master-rx slave register address
 const REG_MTXCNT: usize = 0x10; // master-tx byte count
+#[cfg(feature = "rt-mpu6050")]
+const REG_MRXCNT: usize = 0x14; // master-rx byte count
 const REG_IEN: usize = 0x18; // interrupt enable
 const REG_IPD: usize = 0x1c; // interrupt pending (raw status we poll)
 const TXDATA_BASE: usize = 0x100; // tx FIFO word 0
+#[cfg(feature = "rt-mpu6050")]
+const RXDATA_BASE: usize = 0x200; // rx FIFO word 0
 
 // REG_CON bits
 const CON_EN: u32 = 1 << 0;
 const CON_START: u32 = 1 << 3;
 const CON_STOP: u32 = 1 << 4;
+#[cfg(feature = "rt-mpu6050")]
+const CON_LASTACK: u32 = 1 << 5; // NACK after the last received byte
 
 // REG_CON transfer modes (shifted into bits [2:1] by `con_mod`)
 const MODE_TX: u32 = 0; // write: address + data from tx FIFO
+#[cfg(feature = "rt-mpu6050")]
+const MODE_TRX: u32 = 1; // combined: write register address, then read
 
 const fn con_mod(mode: u32) -> u32 {
     mode << 1
 }
 
+#[cfg(feature = "rt-mpu6050")]
+const MRXADDR_VALID0: u32 = 1 << 24;
+
 // REG_IPD/REG_IEN interrupt bits
 const INT_MBTF: u32 = 1 << 2; // master byte-transmit finished
+#[cfg(feature = "rt-mpu6050")]
+const INT_MBRF: u32 = 1 << 3; // master byte-receive finished
 const INT_START: u32 = 1 << 4; // START generated
 const INT_STOP: u32 = 1 << 5; // STOP generated
 const INT_NAKRCV: u32 = 1 << 6; // NACK received
@@ -206,20 +224,59 @@ const INT_ALL: u32 = 0x7f; // all pending bits (write-1-to-clear)
 /// only bounds a wedged bus.
 const I2C_POLL_MAX: u32 = 100_000;
 /// RT sleep between smooth servo steps.
+#[cfg(not(feature = "rt-mpu6050"))]
 const SERVO_STEP_PERIOD_NANOS: u64 = 50_000_000;
 /// RT retry backoff while waiting for the host to publish the MMIO base.
 const MAP_WAIT_NANOS: u64 = 100_000_000;
 
+#[cfg(not(feature = "rt-mpu6050"))]
 const SERVO_PHYSICAL_RANGE_DEGREES: u16 = 270;
+#[cfg(not(feature = "rt-mpu6050"))]
 const SERVO_MIN_DEGREES: u16 = 60;
+#[cfg(not(feature = "rt-mpu6050"))]
 const SERVO_MAX_DEGREES: u16 = 210;
+#[cfg(not(feature = "rt-mpu6050"))]
 const SERVO_STEP_DEGREES: u16 = 2;
 
+#[cfg(feature = "rt-mpu6050")]
+const MPU6050_ADDRESS_LOW: u8 = 0x68;
+#[cfg(feature = "rt-mpu6050")]
+const MPU6050_ADDRESS_HIGH: u8 = 0x69;
+#[cfg(feature = "rt-mpu6050")]
+const MPU6050_REG_SMPLRT_DIV: u8 = 0x19;
+#[cfg(feature = "rt-mpu6050")]
+const MPU6050_REG_CONFIG: u8 = 0x1a;
+#[cfg(feature = "rt-mpu6050")]
+const MPU6050_REG_GYRO_CONFIG: u8 = 0x1b;
+#[cfg(feature = "rt-mpu6050")]
+const MPU6050_REG_ACCEL_CONFIG: u8 = 0x1c;
+#[cfg(feature = "rt-mpu6050")]
+const MPU6050_REG_ACCEL_XOUT_H: u8 = 0x3b;
+#[cfg(feature = "rt-mpu6050")]
+const MPU6050_REG_PWR_MGMT_1: u8 = 0x6b;
+#[cfg(feature = "rt-mpu6050")]
+const MPU6050_REG_WHO_AM_I: u8 = 0x75;
+#[cfg(feature = "rt-mpu6050")]
+const MPU6050_SAMPLE_PERIOD_NANOS: u64 = 100_000_000;
+
+#[cfg(not(feature = "rt-mpu6050"))]
 const LU9685_I2C_DEVICES: [Lu9685I2cConfig; 1] = [Lu9685I2cConfig {
     name: "LU9685@I2C5",
     address: 0x00,
     channels: &[0, 2],
 }];
+
+#[cfg(feature = "rt-mpu6050")]
+const MPU6050_DEVICES: [Mpu6050Config; 2] = [
+    Mpu6050Config {
+        name: "MPU6050@0x68",
+        address: MPU6050_ADDRESS_LOW,
+    },
+    Mpu6050Config {
+        name: "MPU6050@0x69",
+        address: MPU6050_ADDRESS_HIGH,
+    },
+];
 
 #[derive(Clone, Copy)]
 struct I2cBusConfig {
@@ -230,10 +287,52 @@ struct I2cBusConfig {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(not(feature = "rt-mpu6050"))]
 struct Lu9685I2cConfig {
     name: &'static str,
     address: u8,
     channels: &'static [u8],
+}
+
+#[derive(Clone, Copy)]
+#[cfg(feature = "rt-mpu6050")]
+struct Mpu6050Config {
+    name: &'static str,
+    address: u8,
+}
+
+#[cfg(feature = "rt-mpu6050")]
+struct Mpu6050Sample {
+    acc_raw: [i16; 3],
+    temperature_raw: i16,
+    gyro_raw: [i16; 3],
+}
+
+struct I2cTransaction<'a> {
+    controller: &'a Rk3xI2c,
+}
+
+impl<'a> I2cTransaction<'a> {
+    fn claim(controller: &'a Rk3xI2c) -> Option<Self> {
+        I2C5_RT_BUSY
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| Self { controller })
+    }
+}
+
+impl Drop for I2cTransaction<'_> {
+    fn drop(&mut self) {
+        I2C5_RT_BUSY.store(false, Ordering::Release);
+    }
+}
+
+impl core::ops::Deref for I2cTransaction<'_> {
+    type Target = Rk3xI2c;
+
+    fn deref(&self) -> &Rk3xI2c {
+        self.controller
+    }
 }
 
 /// Outcome of waiting on an I2C completion event.
@@ -421,6 +520,7 @@ impl Rk3xI2c {
     }
 
     /// LU9685 I2C write: `[START][chip.W][channel][angle][STOP]`.
+    #[cfg(not(feature = "rt-mpu6050"))]
     fn write_lu9685_angle(&self, chip: u8, channel: u8, raw_angle: u8) -> Result<(), I2cErr> {
         self.send_start()?;
         let word0 = ((chip as u32) << 1) | ((channel as u32) << 8) | ((raw_angle as u32) << 16);
@@ -429,6 +529,42 @@ impl Rk3xI2c {
         self.w(REG_MTXCNT, 3);
         self.w(REG_IEN, INT_MBTF | INT_NAKRCV);
         let res = self.wait_ipd(INT_MBTF);
+        let _ = self.send_stop();
+        self.disable();
+        res
+    }
+
+    /// SMBus-style single-byte register write: `[START][chip.W][reg][val][STOP]`.
+    #[cfg(feature = "rt-mpu6050")]
+    fn write_reg(&self, chip: u8, reg: u8, value: u8) -> Result<(), I2cErr> {
+        self.send_start()?;
+        let word0 = ((chip as u32) << 1) | ((reg as u32) << 8) | ((value as u32) << 16);
+        self.w(TXDATA_BASE, word0);
+        self.w(REG_CON, CON_EN | con_mod(MODE_TX));
+        self.w(REG_MTXCNT, 3);
+        self.w(REG_IEN, INT_MBTF | INT_NAKRCV);
+        let res = self.wait_ipd(INT_MBTF);
+        let _ = self.send_stop();
+        self.disable();
+        res
+    }
+
+    /// Combined register read: write one register byte, repeated START, then read.
+    #[cfg(feature = "rt-mpu6050")]
+    fn read_regs(&self, chip: u8, reg: u8, out: &mut [u8]) -> Result<(), I2cErr> {
+        self.send_start()?;
+        self.w(REG_MRXADDR, (((chip as u32) << 1) | 1) | MRXADDR_VALID0);
+        self.w(REG_MRXRADDR, (reg as u32) | MRXADDR_VALID0);
+        self.w(REG_CON, CON_EN | CON_LASTACK | con_mod(MODE_TRX));
+        self.w(REG_MRXCNT, out.len() as u32);
+        self.w(REG_IEN, INT_MBRF | INT_NAKRCV);
+        let res = self.wait_ipd(INT_MBRF);
+        if res.is_ok() {
+            for (index, byte) in out.iter_mut().enumerate() {
+                let word = self.r(RXDATA_BASE + (index / 4) * 4);
+                *byte = ((word >> ((index % 4) * 8)) & 0xff) as u8;
+            }
+        }
         let _ = self.send_stop();
         self.disable();
         res
@@ -451,6 +587,7 @@ fn rt_write_hex32(v: u32) {
 }
 
 /// Write `v` as two lowercase hex digits (no `0x` prefix) to the RT output ring.
+#[cfg(not(feature = "rt-mpu6050"))]
 fn rt_write_hex8(v: u8) {
     let hex = |nib: u8| {
         if nib < 10 {
@@ -627,38 +764,45 @@ pub fn setup_host_side() {
     }
 }
 
+fn controller_from_published_base() -> Option<Rk3xI2c> {
+    let virt = I2C5_BUS.virt.load(Ordering::Acquire);
+    if virt == 0 {
+        return None;
+    }
+
+    // SAFETY: `virt` was produced by `setup_host_side` on a host CPU via
+    // `ioremap_raw` of `[I2C5_BASE, I2C5_BASE + I2C5_SIZE)` into the shared
+    // kernel page table, as DEVICE memory. The RT core shares that page table,
+    // so the mapping is valid here. The Axvisor host configures no I2C driver
+    // and I2C5 is disabled in the DTB; feature-gated RT users serialize hardware
+    // transfers through `I2C5_RT_BUSY`.
+    let mmio = unsafe {
+        MmioRaw::new(
+            (I2C5_BUS.base as u64).into(),
+            NonNull::new_unchecked(virt as *mut u8),
+            I2C5_BUS.size,
+        )
+    };
+    Some(Rk3xI2c { mmio })
+}
+
 /// RT task body: once the host has published the I2C5 base, smoothly sweep the
 /// LU9685 channels 0 and 2 through a safe mid-range window.
 ///
 /// Runs on the reserved RT core and uses only RT-safe APIs (`rt_output_write`,
 /// `rt_sleep`, and the polling `Rk3xI2c`); it never takes a host lock or maps
 /// memory itself.
+#[cfg(not(feature = "rt-mpu6050"))]
 pub fn i2c_servo_task() -> ! {
     let mut probed_mmio = false;
     let mut motion = ServoMotion::new(SERVO_MIN_DEGREES, SERVO_MAX_DEGREES, SERVO_STEP_DEGREES);
     let mut report_countdown = 0u8;
     loop {
-        let virt = I2C5_BUS.virt.load(Ordering::Acquire);
-        if virt == 0 {
+        let Some(controller) = controller_from_published_base() else {
             // Host has not finished mapping I2C5 yet; back off and retry.
             rt_sleep(MAP_WAIT_NANOS);
             continue;
-        }
-
-        // SAFETY: `virt` was produced by `setup_host_side` on a host CPU via
-        // `ioremap_raw` of `[I2C5_BASE, I2C5_BASE + I2C5_SIZE)` into the shared
-        // kernel page table, as DEVICE memory. The RT core shares that page
-        // table, so the mapping is valid here. The Axvisor host configures no
-        // I2C driver and I2C5 is disabled in the DTB, so the reserved core is
-        // the sole user of this window — no aliasing or concurrent access.
-        let mmio = unsafe {
-            MmioRaw::new(
-                (I2C5_BUS.base as u64).into(),
-                NonNull::new_unchecked(virt as *mut u8),
-                I2C5_BUS.size,
-            )
         };
-        let controller = Rk3xI2c { mmio };
         if !probed_mmio {
             controller.rt_mmio_write_readback_probe();
             probed_mmio = true;
@@ -684,6 +828,7 @@ pub fn i2c_servo_task() -> ! {
     }
 }
 
+#[cfg(not(feature = "rt-mpu6050"))]
 struct ServoMotion {
     position: u16,
     min: u16,
@@ -692,6 +837,7 @@ struct ServoMotion {
     ascending: bool,
 }
 
+#[cfg(not(feature = "rt-mpu6050"))]
 impl ServoMotion {
     const fn new(min: u16, max: u16, step: u16) -> Self {
         Self {
@@ -726,20 +872,142 @@ impl ServoMotion {
     }
 }
 
+#[cfg(not(feature = "rt-mpu6050"))]
 fn send_servo_positions(controller: &Rk3xI2c, raw_angle: u8) -> Result<(), I2cErr> {
     for device in LU9685_I2C_DEVICES {
         for &channel in device.channels {
-            controller.write_lu9685_angle(device.address, channel, raw_angle)?;
+            let Some(transaction) = I2cTransaction::claim(controller) else {
+                return Err(I2cErr::Timeout);
+            };
+            transaction.write_lu9685_angle(device.address, channel, raw_angle)?;
         }
     }
     Ok(())
 }
 
+#[cfg(feature = "rt-mpu6050")]
+pub fn i2c_mpu6050_task() -> ! {
+    let mut probed_mmio = false;
+    let mut initialized = false;
+    let mut active_device = None;
+    loop {
+        let Some(controller) = controller_from_published_base() else {
+            rt_sleep(MAP_WAIT_NANOS);
+            continue;
+        };
+        if !probed_mmio {
+            controller.rt_mmio_write_readback_probe();
+            probed_mmio = true;
+        }
+
+        if !initialized {
+            match find_and_initialize_mpu6050(&controller) {
+                Ok(device) => {
+                    report_mpu6050_initialized(device);
+                    active_device = Some(device);
+                    initialized = true;
+                }
+                Err(err) => {
+                    report_mpu6050_failure(&controller, b"init", err);
+                    rt_sleep(MAP_WAIT_NANOS);
+                    continue;
+                }
+            }
+        }
+
+        if let Some(device) = active_device {
+            match read_mpu6050_sample(&controller, device) {
+                Ok(sample) => report_mpu6050_sample(device, &sample),
+                Err(err) => report_mpu6050_failure(&controller, b"read", err),
+            }
+        }
+        rt_sleep(MPU6050_SAMPLE_PERIOD_NANOS);
+    }
+}
+
+#[cfg(feature = "rt-mpu6050")]
+fn find_and_initialize_mpu6050(controller: &Rk3xI2c) -> Result<Mpu6050Config, I2cErr> {
+    for device in MPU6050_DEVICES {
+        let mut who_am_i = [0u8; 1];
+        {
+            let Some(transaction) = I2cTransaction::claim(controller) else {
+                return Err(I2cErr::Timeout);
+            };
+            if transaction
+                .read_regs(device.address, MPU6050_REG_WHO_AM_I, &mut who_am_i)
+                .is_err()
+            {
+                continue;
+            }
+        }
+        if who_am_i[0] & 0x7e == 0x68 {
+            initialize_mpu6050(controller, device)?;
+            return Ok(device);
+        }
+    }
+    Err(I2cErr::Nak)
+}
+
+#[cfg(feature = "rt-mpu6050")]
+fn initialize_mpu6050(controller: &Rk3xI2c, device: Mpu6050Config) -> Result<(), I2cErr> {
+    write_mpu6050_reg(controller, device, MPU6050_REG_PWR_MGMT_1, 0x01)?;
+    rt_sleep(MAP_WAIT_NANOS);
+    write_mpu6050_reg(controller, device, MPU6050_REG_SMPLRT_DIV, 9)?;
+    write_mpu6050_reg(controller, device, MPU6050_REG_CONFIG, 0x03)?;
+    write_mpu6050_reg(controller, device, MPU6050_REG_GYRO_CONFIG, 0x00)?;
+    write_mpu6050_reg(controller, device, MPU6050_REG_ACCEL_CONFIG, 0x00)
+}
+
+#[cfg(feature = "rt-mpu6050")]
+fn write_mpu6050_reg(
+    controller: &Rk3xI2c,
+    device: Mpu6050Config,
+    reg: u8,
+    value: u8,
+) -> Result<(), I2cErr> {
+    let Some(transaction) = I2cTransaction::claim(controller) else {
+        return Err(I2cErr::Timeout);
+    };
+    transaction.write_reg(device.address, reg, value)
+}
+
+#[cfg(feature = "rt-mpu6050")]
+fn read_mpu6050_sample(
+    controller: &Rk3xI2c,
+    device: Mpu6050Config,
+) -> Result<Mpu6050Sample, I2cErr> {
+    let mut data = [0u8; 14];
+    let Some(transaction) = I2cTransaction::claim(controller) else {
+        return Err(I2cErr::Timeout);
+    };
+    transaction.read_regs(device.address, MPU6050_REG_ACCEL_XOUT_H, &mut data)?;
+    Ok(Mpu6050Sample {
+        acc_raw: [
+            combine_i16(data[0], data[1]),
+            combine_i16(data[2], data[3]),
+            combine_i16(data[4], data[5]),
+        ],
+        temperature_raw: combine_i16(data[6], data[7]),
+        gyro_raw: [
+            combine_i16(data[8], data[9]),
+            combine_i16(data[10], data[11]),
+            combine_i16(data[12], data[13]),
+        ],
+    })
+}
+
+#[cfg(feature = "rt-mpu6050")]
+fn combine_i16(high: u8, low: u8) -> i16 {
+    i16::from_be_bytes([high, low])
+}
+
+#[cfg(not(feature = "rt-mpu6050"))]
 fn physical_to_lu9685_angle(physical_degrees: u16) -> u8 {
     ((physical_degrees * 180 + SERVO_PHYSICAL_RANGE_DEGREES / 2) / SERVO_PHYSICAL_RANGE_DEGREES)
         as u8
 }
 
+#[cfg(not(feature = "rt-mpu6050"))]
 fn report_servo_position(physical_degrees: u16, raw_angle: u8) {
     rt_output_write(b"RT i2c5");
     for device in LU9685_I2C_DEVICES {
@@ -755,6 +1023,7 @@ fn report_servo_position(physical_degrees: u16, raw_angle: u8) {
     rt_output_write(b"\n");
 }
 
+#[cfg(not(feature = "rt-mpu6050"))]
 fn report_servo_failure(controller: &Rk3xI2c, err: I2cErr, physical_degrees: u16, raw_angle: u8) {
     rt_output_write(b"RT i2c5 LU9685 write FAIL ");
     match err {
@@ -774,4 +1043,90 @@ fn report_servo_failure(controller: &Rk3xI2c, err: I2cErr, physical_degrees: u16
     rt_output_write(b" IEN=");
     rt_write_hex32(controller.r(REG_IEN));
     rt_output_write(b"\n");
+}
+
+#[cfg(feature = "rt-mpu6050")]
+fn report_mpu6050_initialized(device: Mpu6050Config) {
+    rt_output_write(b"RT i2c5 ");
+    rt_output_write(device.name.as_bytes());
+    rt_output_write(b" initialized: sample=100Hz dlpf=44Hz gyro=+/-250dps accel=+/-2g\n");
+}
+
+#[cfg(feature = "rt-mpu6050")]
+fn report_mpu6050_sample(device: Mpu6050Config, sample: &Mpu6050Sample) {
+    rt_output_write(b"RT i2c5 ");
+    rt_output_write(device.name.as_bytes());
+    rt_output_write(b"\n  acc_raw[3]  x=");
+    rt_write_i16(sample.acc_raw[0]);
+    rt_output_write(b" y=");
+    rt_write_i16(sample.acc_raw[1]);
+    rt_output_write(b" z=");
+    rt_write_i16(sample.acc_raw[2]);
+    rt_output_write(b"\n  acc_mg[3]   x=");
+    rt_write_i32(raw_accel_to_milli_g(sample.acc_raw[0]));
+    rt_output_write(b" y=");
+    rt_write_i32(raw_accel_to_milli_g(sample.acc_raw[1]));
+    rt_output_write(b" z=");
+    rt_write_i32(raw_accel_to_milli_g(sample.acc_raw[2]));
+    rt_output_write(b"\n  gyro_raw[3] x=");
+    rt_write_i16(sample.gyro_raw[0]);
+    rt_output_write(b" y=");
+    rt_write_i16(sample.gyro_raw[1]);
+    rt_output_write(b" z=");
+    rt_write_i16(sample.gyro_raw[2]);
+    rt_output_write(b"\n  gyro_dps_x100[3] x=");
+    rt_write_i32(raw_gyro_to_dps_x100(sample.gyro_raw[0]));
+    rt_output_write(b" y=");
+    rt_write_i32(raw_gyro_to_dps_x100(sample.gyro_raw[1]));
+    rt_output_write(b" z=");
+    rt_write_i32(raw_gyro_to_dps_x100(sample.gyro_raw[2]));
+    rt_output_write(b" temp_raw=");
+    rt_write_i16(sample.temperature_raw);
+    rt_output_write(b"\n");
+}
+
+#[cfg(feature = "rt-mpu6050")]
+fn report_mpu6050_failure(controller: &Rk3xI2c, operation: &[u8], err: I2cErr) {
+    rt_output_write(b"RT i2c5 MPU6050 ");
+    rt_output_write(operation);
+    rt_output_write(b" FAIL ");
+    match err {
+        I2cErr::Nak => rt_output_write(b"NAK"),
+        I2cErr::Timeout => rt_output_write(b"timeout"),
+    }
+    rt_output_write(b" CON=");
+    rt_write_hex32(controller.r(REG_CON));
+    rt_output_write(b" IPD=");
+    rt_write_hex32(controller.r(REG_IPD));
+    rt_output_write(b" CLKDIV=");
+    rt_write_hex32(controller.r(REG_CLKDIV));
+    rt_output_write(b" IEN=");
+    rt_write_hex32(controller.r(REG_IEN));
+    rt_output_write(b"\n");
+}
+
+#[cfg(feature = "rt-mpu6050")]
+fn rt_write_i16(value: i16) {
+    if value < 0 {
+        rt_output_write(b"-");
+    }
+    ax_rt::rt_output_write_decimal(value.unsigned_abs() as u64);
+}
+
+#[cfg(feature = "rt-mpu6050")]
+fn rt_write_i32(value: i32) {
+    if value < 0 {
+        rt_output_write(b"-");
+    }
+    ax_rt::rt_output_write_decimal(value.unsigned_abs() as u64);
+}
+
+#[cfg(feature = "rt-mpu6050")]
+fn raw_accel_to_milli_g(raw: i16) -> i32 {
+    (raw as i32 * 1000) / 16384
+}
+
+#[cfg(feature = "rt-mpu6050")]
+fn raw_gyro_to_dps_x100(raw: i16) -> i32 {
+    (raw as i32 * 100) / 131
 }

@@ -52,25 +52,40 @@ const DEMO_TASK_COUNT: usize = 3;
 /// Optional extra RT tasks appended to the table when their feature is enabled.
 /// Kept as a fixed-length const array so the combined table stays a single
 /// `'static` slice buildable in `const` context.
-#[cfg(feature = "rt-i2c")]
+#[cfg(all(feature = "rt-i2c", not(feature = "rt-mpu6050")))]
 const I2C_EXTRA_COUNT: usize = 1;
-#[cfg(not(feature = "rt-i2c"))]
+#[cfg(not(all(feature = "rt-i2c", not(feature = "rt-mpu6050"))))]
 const I2C_EXTRA_COUNT: usize = 0;
+
+#[cfg(feature = "rt-mpu6050")]
+const MPU6050_EXTRA_COUNT: usize = 1;
+#[cfg(not(feature = "rt-mpu6050"))]
+const MPU6050_EXTRA_COUNT: usize = 0;
 
 #[cfg(feature = "rt-uart")]
 const UART_EXTRA_COUNT: usize = 1;
 #[cfg(not(feature = "rt-uart"))]
 const UART_EXTRA_COUNT: usize = 0;
 
-#[cfg(feature = "rt-i2c")]
+#[cfg(all(feature = "rt-i2c", not(feature = "rt-mpu6050")))]
 const I2C_EXTRA: [RtTask; I2C_EXTRA_COUNT] = [RtTask::with_priority(
     "i2c-servo",
     50_000_000,
     1,
     crate::i2c_rt::i2c_servo_task,
 )];
-#[cfg(not(feature = "rt-i2c"))]
+#[cfg(not(all(feature = "rt-i2c", not(feature = "rt-mpu6050"))))]
 const I2C_EXTRA: [RtTask; I2C_EXTRA_COUNT] = [];
+
+#[cfg(feature = "rt-mpu6050")]
+const MPU6050_EXTRA: [RtTask; MPU6050_EXTRA_COUNT] = [RtTask::with_priority(
+    "i2c-mpu6050",
+    100_000_000,
+    1,
+    crate::i2c_rt::i2c_mpu6050_task,
+)];
+#[cfg(not(feature = "rt-mpu6050"))]
+const MPU6050_EXTRA: [RtTask; MPU6050_EXTRA_COUNT] = [];
 
 #[cfg(feature = "rt-uart")]
 const UART_EXTRA: [RtTask; UART_EXTRA_COUNT] = [RtTask::with_priority(
@@ -97,6 +112,7 @@ static RT_TASKS: [RtTask;
         + ax_rt::selftest::SELFTEST_TASKS.len()
         + ax_rt::benchmark::BENCHMARK_TASKS.len()
         + I2C_EXTRA_COUNT
+        + MPU6050_EXTRA_COUNT
         + UART_EXTRA_COUNT] = rt_tasks_with_selftest();
 
 /// Builds the combined RT task table: demo tasks, the self-test suite, the
@@ -108,11 +124,17 @@ const fn rt_tasks_with_selftest() -> [RtTask;
         + ax_rt::selftest::SELFTEST_TASKS.len()
         + ax_rt::benchmark::BENCHMARK_TASKS.len()
         + I2C_EXTRA_COUNT
+        + MPU6050_EXTRA_COUNT
         + UART_EXTRA_COUNT] {
     const SELFTEST: [RtTask; 8] = ax_rt::selftest::SELFTEST_TASKS;
     const BENCHMARK: [RtTask; 7] = ax_rt::benchmark::BENCHMARK_TASKS;
     let mut out = [DEMO_TASKS[0];
-        DEMO_TASK_COUNT + SELFTEST.len() + BENCHMARK.len() + I2C_EXTRA_COUNT + UART_EXTRA_COUNT];
+        DEMO_TASK_COUNT
+            + SELFTEST.len()
+            + BENCHMARK.len()
+            + I2C_EXTRA_COUNT
+            + MPU6050_EXTRA_COUNT
+            + UART_EXTRA_COUNT];
     let mut i = 0;
     while i < DEMO_TASK_COUNT {
         out[i] = DEMO_TASKS[i];
@@ -133,23 +155,36 @@ const fn rt_tasks_with_selftest() -> [RtTask;
         out[DEMO_TASK_COUNT + SELFTEST.len() + BENCHMARK.len() + m] = I2C_EXTRA[m];
         m += 1;
     }
+    let mut p = 0;
+    while p < MPU6050_EXTRA_COUNT {
+        out[DEMO_TASK_COUNT + SELFTEST.len() + BENCHMARK.len() + I2C_EXTRA_COUNT + p] =
+            MPU6050_EXTRA[p];
+        p += 1;
+    }
     let mut n = 0;
     while n < UART_EXTRA_COUNT {
-        out[DEMO_TASK_COUNT + SELFTEST.len() + BENCHMARK.len() + I2C_EXTRA_COUNT + n] =
-            UART_EXTRA[n];
+        out[DEMO_TASK_COUNT
+            + SELFTEST.len()
+            + BENCHMARK.len()
+            + I2C_EXTRA_COUNT
+            + MPU6050_EXTRA_COUNT
+            + n] = UART_EXTRA[n];
         n += 1;
     }
     out
 }
 
 #[cfg(not(feature = "rt-selftest"))]
-static RT_TASKS: [RtTask; DEMO_TASK_COUNT + I2C_EXTRA_COUNT + UART_EXTRA_COUNT] = rt_tasks_base();
+static RT_TASKS: [RtTask;
+    DEMO_TASK_COUNT + I2C_EXTRA_COUNT + MPU6050_EXTRA_COUNT + UART_EXTRA_COUNT] = rt_tasks_base();
 
 /// Builds the RT task table without the self-test/benchmark suites: demo tasks
 /// followed by any feature-gated extras.
 #[cfg(not(feature = "rt-selftest"))]
-const fn rt_tasks_base() -> [RtTask; DEMO_TASK_COUNT + I2C_EXTRA_COUNT + UART_EXTRA_COUNT] {
-    let mut out = [DEMO_TASKS[0]; DEMO_TASK_COUNT + I2C_EXTRA_COUNT + UART_EXTRA_COUNT];
+const fn rt_tasks_base()
+-> [RtTask; DEMO_TASK_COUNT + I2C_EXTRA_COUNT + MPU6050_EXTRA_COUNT + UART_EXTRA_COUNT] {
+    let mut out =
+        [DEMO_TASKS[0]; DEMO_TASK_COUNT + I2C_EXTRA_COUNT + MPU6050_EXTRA_COUNT + UART_EXTRA_COUNT];
     let mut i = 0;
     while i < DEMO_TASK_COUNT {
         out[i] = DEMO_TASKS[i];
@@ -160,9 +195,14 @@ const fn rt_tasks_base() -> [RtTask; DEMO_TASK_COUNT + I2C_EXTRA_COUNT + UART_EX
         out[DEMO_TASK_COUNT + m] = I2C_EXTRA[m];
         m += 1;
     }
+    let mut p = 0;
+    while p < MPU6050_EXTRA_COUNT {
+        out[DEMO_TASK_COUNT + I2C_EXTRA_COUNT + p] = MPU6050_EXTRA[p];
+        p += 1;
+    }
     let mut n = 0;
     while n < UART_EXTRA_COUNT {
-        out[DEMO_TASK_COUNT + I2C_EXTRA_COUNT + n] = UART_EXTRA[n];
+        out[DEMO_TASK_COUNT + I2C_EXTRA_COUNT + MPU6050_EXTRA_COUNT + n] = UART_EXTRA[n];
         n += 1;
     }
     out

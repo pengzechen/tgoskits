@@ -58,6 +58,9 @@ rt-selftest = ["ax-rt/selftest"]
 # header bus, `disabled` in the DTB) and drives configured LU9685 I2C devices.
 # Board-specific; off by default.
 rt-i2c = ["dep:axklib", "dep:mmio-api"]
+# Adds an RT task that probes and samples an MPU6050 on the same RK3588 I2C5
+# header bus. Requires rt-i2c because that feature owns the I2C5 bring-up.
+rt-mpu6050 = ["rt-i2c"]
 # Adds an RT task that drives configured LU9685 UART devices through RK3588
 # UART1. On OrangePi-5-Plus this uses the same GPIO1_B6/B7 header pins as I2C5,
 # so do not enable it together with rt-i2c unless the board wiring is changed.

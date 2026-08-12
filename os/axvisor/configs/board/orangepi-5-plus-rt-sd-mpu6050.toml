@@ -1,0 +1,26 @@
+# Axvisor RT shell build for OrangePi-5-Plus (RK3588, 8 cores), booted from the
+# microSD card slot, with MPU6050 sampling over I2C5.
+#
+# I2C wiring on the 40-pin header:
+#   GPIO1_B6 -> MPU6050 SCL
+#   GPIO1_B7 -> MPU6050 SDA
+#   GND      -> MPU6050 GND
+#   3V3      -> MPU6050 VCC
+#
+# Do not enable rt-uart in this config: UART1 uses the same GPIO1_B6/B7 pins on
+# this board. LU9685 can share this I2C bus only if its address differs from the
+# MPU6050 address (0x68/0x69) and both devices are wired for the same voltage.
+features = [
+  "ax-driver/rockchip-dwmmc",
+  "fs",
+  "realtime",
+  "rt-selftest",
+  "rt-mpu6050",
+]
+log = "Info"
+target = "aarch64-unknown-none-softfloat"
+vm_configs = []
+
+[env]
+AX_RT_CPU = "7"
+SMP = "8"
