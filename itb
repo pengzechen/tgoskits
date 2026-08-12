@@ -1,0 +1,29 @@
+1. 编译 axvisor（产出 ELF）
+cd os/axvisor
+cargo xtask build --config configs/board/orangepi-5-plus-rt-sd.toml
+# ELF 落在: target/aarch64-unknown-linux-musl/release/axvisor
+
+2. ELF → 扁平二进制 axvisor.bin
+cd /home/ajax/Desktop/Project/Kernel/tgoskits
+rust-objcopy -O binary --strip-all \
+  target/aarch64-unknown-linux-musl/release/axvisor \
+  tmp/orangepi-rt-fit/axvisor.bin
+
+3. mkimage 打包 FIT → axvisor.itb
+cd tmp/orangepi-rt-fit
+mkimage -f axvisor.its axvisor.itb
+
+其中 tmp/orangepi-rt-fit/axvisor.its（沿用上次的，未改动）描述了镜像布局：
+
+images {
+    kernel { data = /incbin/("axvisor.bin"); type="kernel"; arch="arm64";
+             os="linux"; compression="none"; load=<0x02080000>; entry=<0x02080000>; };
+    fdt    { data = /incbin/("orangepi-5-plus.dtb"); type="flat_dt"; arch="arm64";
+             load=<0x0a100000>; };
+}
+configurations { default="conf"; conf { kernel="kernel"; fdt="fdt"; }; }
+
+.its 用 /incbin/ 相对引用同目录的 axvisor.bin 和 orangepi-5-plus.dtb，所以第 2、3 步都在 tmp/orangepi-rt-fit/ 里跑。加载/入口地址 0x02080000、DTB 加载 0x0a100000 与 U-Boot 的 bootm 0x10000000 启动流程配套。
+
+
+load mmc 1:1 0x10000000 axvisor.itb; bootm 0x10000000

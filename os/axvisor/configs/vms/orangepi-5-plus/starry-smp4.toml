@@ -1,0 +1,36 @@
+# VM base information.
+[base]
+id = 1
+name = "starry"
+guest_type = "passthrough"
+# Four guest vCPUs. `cpu_num` must equal `phys_cpu_ids.len()`.
+cpu_num = 4
+# Pin the guest to RK3588 physical cores 0..3 (matching the host DTB CPU
+# affinities used by the orangepi-5-plus Linux guest). Core 7 (0x700) is
+# reserved for the Axvisor RT executor via AX_RT_CPU=7; the AxVM host only
+# schedules vCPUs on the host CPU set (cores 0..6), and the one-hot
+# `phys_cpu_sets` below keeps placement deterministic and off the RT core.
+# The guest `/cpus` nodes are derived from `phys_cpu_ids` against the host
+# DTB, so these four entries yield a four-CPU guest device tree.
+phys_cpu_ids = [0x00, 0x100, 0x200, 0x300]
+phys_cpu_sets = [1, 2, 4, 8]
+
+# StarryOS is an AArch64 Image and receives the generated guest DTB in x0.
+[kernel]
+entry_point = 0x4008_0000
+image_location = "fs"
+kernel_load_addr = 0x4008_0000
+kernel_path = "/guest/starry/orangepi-5-plus"
+dtb_load_addr = 0x4000_0000
+
+# Keep a fixed 256 MiB region below 4 GiB for the kernel and DMA32 devices,
+# while allowing ordinary allocations to use the 2 GiB high-memory region.
+memory_regions = [
+    [0x4000_0000, 0x1000_0000, 0x7, 2],
+    [0x2_4000_0000, 0x8000_0000, 0x7, 1],
+]
+
+# Physical-device selection. Virtual platform devices are machine-owned.
+[devices]
+passthrough = []
+disabled = [{ path = "/pcie@fe150000" }, { path = "/pcie@fe160000" }, { path = "/pcie@fe170000" }, { path = "/pcie@fe180000" }, { path = "/pcie@fe190000" }]

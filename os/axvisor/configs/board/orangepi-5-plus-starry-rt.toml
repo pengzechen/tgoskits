@@ -1,0 +1,25 @@
+# Axvisor build for OrangePi-5-Plus (RK3588, 8 cores) running a 4-vCPU StarryOS
+# guest alongside a reserved realtime core.
+#
+# Extends the tested `orangepi-5-plus-starry` board build
+# (test-suit/axvisor/normal/board-orangepi-5-plus/starry) with realtime CPU
+# partitioning: SMP=8 with AX_RT_CPU=7 reserves the last logical CPU (core 7)
+# for the isolated ax-rt executor, leaving host cores 0..6 for the Axvisor host
+# runtime and the StarryOS guest vCPUs.
+#
+# The board test flow builds with `smp = None`, so SMP and AX_RT_CPU are carried
+# through the `[env]` table below (the same channel the qemu-rt-benchmark case
+# uses); they feed axruntime's build.rs, which validates AX_RT_CPU == SMP - 1.
+features = [
+  "ax-driver/rockchip-sdhci",
+  "fs",
+  "realtime",
+  "rt-selftest",
+]
+log = "Info"
+target = "aarch64-unknown-none-softfloat"
+vm_configs = ["os/axvisor/configs/vms/orangepi-5-plus/starry-smp4.toml"]
+
+[env]
+AX_RT_CPU = "7"
+SMP = "8"

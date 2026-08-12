@@ -1,0 +1,29 @@
+/dts-v1/;
+/ {
+    description = "axvisor rk3588 RT (host cpu0-6 + ax-rt on cpu7), SD/dwmmc, root=/dev/mmcblk0p2";
+    #address-cells = <1>;
+    images {
+        kernel {
+            data = /incbin/("axvisor.bin");
+            type = "kernel";
+            arch = "arm64";
+            os = "linux";
+            compression = "none";
+            load = <0x02080000>;
+            entry = <0x02080000>;
+        };
+        fdt {
+            data = /incbin/("orangepi-5-plus.dtb");
+            type = "flat_dt";
+            arch = "arm64";
+            load = <0x0a100000>;
+        };
+    };
+    configurations {
+        default = "conf";
+        conf {
+            kernel = "kernel";
+            fdt = "fdt";
+        };
+    };
+};

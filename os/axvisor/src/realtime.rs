@@ -49,6 +49,39 @@ static RT_SAMPLE_MUTEX: RtMutex = RtMutex::new();
 /// Number of Axvisor demo service tasks that always run on the reserved core.
 const DEMO_TASK_COUNT: usize = 3;
 
+/// Optional extra RT tasks appended to the table when their feature is enabled.
+/// Kept as a fixed-length const array so the combined table stays a single
+/// `'static` slice buildable in `const` context.
+#[cfg(feature = "rt-i2c")]
+const I2C_EXTRA_COUNT: usize = 1;
+#[cfg(not(feature = "rt-i2c"))]
+const I2C_EXTRA_COUNT: usize = 0;
+
+#[cfg(feature = "rt-uart")]
+const UART_EXTRA_COUNT: usize = 1;
+#[cfg(not(feature = "rt-uart"))]
+const UART_EXTRA_COUNT: usize = 0;
+
+#[cfg(feature = "rt-i2c")]
+const I2C_EXTRA: [RtTask; I2C_EXTRA_COUNT] = [RtTask::with_priority(
+    "i2c-servo",
+    50_000_000,
+    1,
+    crate::i2c_rt::i2c_servo_task,
+)];
+#[cfg(not(feature = "rt-i2c"))]
+const I2C_EXTRA: [RtTask; I2C_EXTRA_COUNT] = [];
+
+#[cfg(feature = "rt-uart")]
+const UART_EXTRA: [RtTask; UART_EXTRA_COUNT] = [RtTask::with_priority(
+    "uart1-demo",
+    100_000_000,
+    1,
+    crate::uart_rt::uart_task,
+)];
+#[cfg(not(feature = "rt-uart"))]
+const UART_EXTRA: [RtTask; UART_EXTRA_COUNT] = [];
+
 /// Axvisor demo service tasks. These are the always-present RT workload; the
 /// self-test and benchmark suites are appended after them when `rt-selftest` is
 /// enabled.
@@ -62,18 +95,24 @@ const DEMO_TASKS: [RtTask; DEMO_TASK_COUNT] = [
 static RT_TASKS: [RtTask;
     DEMO_TASK_COUNT
         + ax_rt::selftest::SELFTEST_TASKS.len()
-        + ax_rt::benchmark::BENCHMARK_TASKS.len()] = rt_tasks_with_selftest();
+        + ax_rt::benchmark::BENCHMARK_TASKS.len()
+        + I2C_EXTRA_COUNT
+        + UART_EXTRA_COUNT] = rt_tasks_with_selftest();
 
-/// Builds the combined RT task table: demo tasks followed by the self-test
-/// suite. `const` so the table stays a single `'static` slice for the executor.
+/// Builds the combined RT task table: demo tasks, the self-test suite, the
+/// benchmark suite, then any feature-gated extras. `const` so the table stays a
+/// single `'static` slice for the executor.
 #[cfg(feature = "rt-selftest")]
 const fn rt_tasks_with_selftest() -> [RtTask;
     DEMO_TASK_COUNT
         + ax_rt::selftest::SELFTEST_TASKS.len()
-        + ax_rt::benchmark::BENCHMARK_TASKS.len()] {
+        + ax_rt::benchmark::BENCHMARK_TASKS.len()
+        + I2C_EXTRA_COUNT
+        + UART_EXTRA_COUNT] {
     const SELFTEST: [RtTask; 8] = ax_rt::selftest::SELFTEST_TASKS;
     const BENCHMARK: [RtTask; 7] = ax_rt::benchmark::BENCHMARK_TASKS;
-    let mut out = [DEMO_TASKS[0]; DEMO_TASK_COUNT + SELFTEST.len() + BENCHMARK.len()];
+    let mut out = [DEMO_TASKS[0];
+        DEMO_TASK_COUNT + SELFTEST.len() + BENCHMARK.len() + I2C_EXTRA_COUNT + UART_EXTRA_COUNT];
     let mut i = 0;
     while i < DEMO_TASK_COUNT {
         out[i] = DEMO_TASKS[i];
@@ -89,11 +128,45 @@ const fn rt_tasks_with_selftest() -> [RtTask;
         out[DEMO_TASK_COUNT + SELFTEST.len() + k] = BENCHMARK[k];
         k += 1;
     }
+    let mut m = 0;
+    while m < I2C_EXTRA_COUNT {
+        out[DEMO_TASK_COUNT + SELFTEST.len() + BENCHMARK.len() + m] = I2C_EXTRA[m];
+        m += 1;
+    }
+    let mut n = 0;
+    while n < UART_EXTRA_COUNT {
+        out[DEMO_TASK_COUNT + SELFTEST.len() + BENCHMARK.len() + I2C_EXTRA_COUNT + n] =
+            UART_EXTRA[n];
+        n += 1;
+    }
     out
 }
 
 #[cfg(not(feature = "rt-selftest"))]
-static RT_TASKS: [RtTask; DEMO_TASK_COUNT] = DEMO_TASKS;
+static RT_TASKS: [RtTask; DEMO_TASK_COUNT + I2C_EXTRA_COUNT + UART_EXTRA_COUNT] = rt_tasks_base();
+
+/// Builds the RT task table without the self-test/benchmark suites: demo tasks
+/// followed by any feature-gated extras.
+#[cfg(not(feature = "rt-selftest"))]
+const fn rt_tasks_base() -> [RtTask; DEMO_TASK_COUNT + I2C_EXTRA_COUNT + UART_EXTRA_COUNT] {
+    let mut out = [DEMO_TASKS[0]; DEMO_TASK_COUNT + I2C_EXTRA_COUNT + UART_EXTRA_COUNT];
+    let mut i = 0;
+    while i < DEMO_TASK_COUNT {
+        out[i] = DEMO_TASKS[i];
+        i += 1;
+    }
+    let mut m = 0;
+    while m < I2C_EXTRA_COUNT {
+        out[DEMO_TASK_COUNT + m] = I2C_EXTRA[m];
+        m += 1;
+    }
+    let mut n = 0;
+    while n < UART_EXTRA_COUNT {
+        out[DEMO_TASK_COUNT + I2C_EXTRA_COUNT + n] = UART_EXTRA[n];
+        n += 1;
+    }
+    out
+}
 
 /// Axvisor realtime secondary CPU entry.
 ///

@@ -84,6 +84,21 @@ pub fn rust_main_secondary(cpu_id: usize) -> ! {
     info!("Secondary CPU {cpu_id} started.");
 
     if super::secondary_cpu_owner(cpu_id) == super::SecondaryCpuOwner::Realtime {
+        // The reserved realtime core runs its executor forever and never returns
+        // from `run_realtime_secondary`, so it must adopt the host kernel page
+        // table HERE — the unconditional `init_memory_management_secondary()`
+        // below is unreachable on this core. Without this, the reserved core
+        // keeps running on the early boot page table (RAM mapped Normal plus a
+        // single Device page for the debug console; see someboot
+        // `setup_page_table`), which has no Device mapping for host-side
+        // `ioremap_raw` windows. RT primitives that only touch RAM still work,
+        // but any MMIO the core drives through a host-published mapping (for
+        // example an rt-i2c controller window) is serviced by the cacheable RAM
+        // alias: reads observe the device, but stores are absorbed by the cache
+        // and never reach the peripheral. Adopting the kernel page table gives
+        // the reserved core the same Device mappings every host CPU sees.
+        #[cfg(feature = "paging")]
+        ax_mm::init_memory_management_secondary();
         super::run_realtime_secondary(cpu_id);
     }
 

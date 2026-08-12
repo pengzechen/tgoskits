@@ -1,0 +1,34 @@
+# Axvisor RT shell build for OrangePi-5-Plus (RK3588, 8 cores), booted from the
+# microSD card slot.
+#
+# Realtime CPU partitioning: SMP=8 with AX_RT_CPU=7 reserves the last logical
+# CPU (core 7) for the isolated ax-rt executor; host cores 0..6 run the Axvisor
+# host runtime. axruntime's build.rs validates AX_RT_CPU == SMP - 1.
+#
+# Storage: the microSD slot on RK3588 is driven by the DesignWare MMC controller
+# (`rockchip-dwmmc`), NOT the eMMC sdhci controller. `fs` mounts the SD rootfs so
+# the host can later read guest images from it; the exact root partition is
+# selected via the DTB `/chosen/bootargs` `root=PARTUUID=...`.
+#
+# Default servo bring-up config currently selects I2C5. For explicit protocol
+# selection use:
+#   configs/board/orangepi-5-plus-rt-sd-i2c.toml
+#   configs/board/orangepi-5-plus-rt-sd-uart.toml
+#
+# On this board, the tested UART1 and I2C5 modes share GPIO1_B6/B7, so the two
+# protocol features must not be enabled together unless future wiring moves one
+# protocol to a different pin group.
+features = [
+  "ax-driver/rockchip-dwmmc",
+  "fs",
+  "realtime",
+  "rt-selftest",
+  "rt-i2c",
+]
+log = "Info"
+target = "aarch64-unknown-none-softfloat"
+vm_configs = []
+
+[env]
+AX_RT_CPU = "7"
+SMP = "8"

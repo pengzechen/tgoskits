@@ -54,6 +54,14 @@ realtime = []
 # runs it from the host boot CPU. Off by default; enabled on the QEMU dev config
 # to keep validating the RT primitives.
 rt-selftest = ["ax-rt/selftest"]
+# Adds an RT task on the reserved core that brings up RK3588 I2C5 (a 40-pin
+# header bus, `disabled` in the DTB) and drives configured LU9685 I2C devices.
+# Board-specific; off by default.
+rt-i2c = ["dep:axklib", "dep:mmio-api"]
+# Adds an RT task that drives configured LU9685 UART devices through RK3588
+# UART1. On OrangePi-5-Plus this uses the same GPIO1_B6/B7 header pins as I2C5,
+# so do not enable it together with rt-i2c unless the board wiring is changed.
+rt-uart = ["dep:axklib", "dep:mmio-api"]
 sstc = ["axvm/sstc"]
 stack-protector = ["ax-std/stack-protector"]
 backtrace = ["ax-std/backtrace", "dep:axbacktrace"]
@@ -122,6 +130,8 @@ toml.workspace = true
 ax-memory-addr.workspace = true
 ax-driver = { workspace = true, optional = true }
 axbacktrace = { workspace = true, optional = true }
+axklib = { workspace = true, optional = true }
+mmio-api = { workspace = true, optional = true }
 
 [dev-dependencies]
 axtest = { path = "../../components/axtest/axtest" }

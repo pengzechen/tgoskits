@@ -55,15 +55,16 @@ Primary 后续等待条件从“所有物理 CPU 都完成普通 runtime 初始�
 
 所有 secondary CPU 首先进入 `os/arceos/modules/axruntime/src/mp.rs` 的 `rust_main_secondary(cpu_id)`。该函数先处理超过 `CPU_CAPACITY` 的 CPU park，再执行 `ax_hal::percpu::init_secondary(cpu_id)`、`ax_alloc::init_percpu_slab(cpu_id)` 和 `ax_hal::init_early_secondary(cpu_id)`；随后通过 `secondary_cpu_owner(cpu_id)` 判断 CPU 所有权。
 
-下面的状态图描述了当前实际启动路径。RT 分流发生在普通 paging secondary、late HAL、`ax_task` secondary scheduler、IPI init 和 IRQ online 之前，因此 RT CPU 不会被注册进普通 host 调度域。
+下面的状态图描述了当前实际启动路径。RT 分流发生在 late HAL、`ax_task` secondary scheduler、IPI init 和 IRQ online 之前，因此 RT CPU 不会被注册进普通 host 调度域。但 RT 分支在跳入 executor 前必须先执行普通 secondary 的 paging 步骤（`ax_mm::init_memory_management_secondary()`）：因为 `run_realtime_secondary` 是发散的（`-> !`），分流点之后那次无条件的 paging 调用对 RT CPU 是死代码；若不在分支内先切换到 host 内核页表，RT CPU 会一直停留在早期 boot 页表上（RAM 映射为 Normal、仅 debug 串口一页为 Device，见 someboot `setup_page_table`），host 侧 `ioremap_raw`/`ax_mm::iomap` 建立的 Device 窗口对它不可见——只依赖 RAM 的 RT 原语仍能工作，但 RT 核通过 host 发布的映射访问 MMIO 时，读命中的是可缓存的 RAM 别名，写则被缓存吸收、永远到不了外设。
 
 ```mermaid
 stateDiagram-v2
     [*] --> SecondaryEntry
     SecondaryEntry --> Parked: cpu_id >= CPU_CAPACITY
     SecondaryEntry --> MinimalCpuInit: cpu_id < CPU_CAPACITY
-    MinimalCpuInit --> RtEntry: SecondaryCpuOwner::Realtime
+    MinimalCpuInit --> RtAdoptKernelPageTable: SecondaryCpuOwner::Realtime
     MinimalCpuInit --> HostSecondary: SecondaryCpuOwner::Host
+    RtAdoptKernelPageTable --> RtEntry: init_memory_management_secondary
     RtEntry --> RtExecutor: ax_realtime_secondary_main
     HostSecondary --> HostScheduler: init_scheduler_secondary
     HostScheduler --> HostReady: INITED_CPUS += 1
@@ -77,7 +78,7 @@ stateDiagram-v2
 
 RT CPU 的 Axvisor 入口是 `os/axvisor/src/realtime.rs` 中的 `#[unsafe(no_mangle)] pub extern "Rust" fn ax_realtime_secondary_main(cpu_id: usize) -> !`。`axruntime::run_realtime_secondary(cpu_id)` 通过外部符号调用这个入口，使通用 runtime 只负责 CPU 分流，Axvisor glue 负责选择 RT task、时间源和状态发布。
 
-入口函数记录初始 heartbeat/watchdog 时间戳，打印 `Realtime CPU {cpu_id} entered Axvisor RT entry; running isolated executor.`，然后调用 `ax_rt::run_realtime_cpu(cpu_id, &RT_TASKS, monotonic_time_nanos)`。从这一点开始，RT CPU 不返回 `axruntime`，也不会继续执行普通 secondary 的 paging、late HAL、scheduler、IPI 或 IRQ online 代码。
+入口函数记录初始 heartbeat/watchdog 时间戳，打印 `Realtime CPU {cpu_id} entered Axvisor RT entry; running isolated executor.`，然后调用 `ax_rt::run_realtime_cpu(cpu_id, &RT_TASKS, monotonic_time_nanos)`。RT CPU 在进入该入口前，已在 `rust_main_secondary` 的 RT 分支内通过 `ax_mm::init_memory_management_secondary()` 采用了 host 内核页表；从这一点开始，RT CPU 不返回 `axruntime`，也不会继续执行普通 secondary 的 late HAL、scheduler、IPI 或 IRQ online 代码。
 
 ## 3. 侵入点
 

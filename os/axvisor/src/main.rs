@@ -39,9 +39,13 @@ mod console_regression;
 mod guest_console;
 #[cfg(feature = "http-axum")]
 mod http;
+#[cfg(feature = "rt-i2c")]
+mod i2c_rt;
 mod manager;
 mod realtime;
 mod shell;
+#[cfg(feature = "rt-uart")]
+mod uart_rt;
 
 #[cfg(any(feature = "backtrace", feature = "test-panic-no-backtrace"))]
 fn init_panic_hook() {
@@ -141,6 +145,10 @@ fn main() {
     #[cfg(not(feature = "no-auto-start"))]
     info!("[OK] Default guest initialized");
     ax_realtime::setup_host_side();
+    #[cfg(feature = "rt-i2c")]
+    i2c_rt::setup_host_side();
+    #[cfg(feature = "rt-uart")]
+    uart_rt::setup_host_side();
     realtime::run_rt_selftests();
 
     // The management console runs on the primary CPU (Core 0) while the vCPU

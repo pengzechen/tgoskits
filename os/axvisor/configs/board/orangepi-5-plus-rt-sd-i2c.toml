@@ -1,0 +1,24 @@
+# Axvisor RT shell build for OrangePi-5-Plus (RK3588, 8 cores), booted from the
+# microSD card slot, with LU9685 servo control over I2C5.
+#
+# I2C wiring on the 40-pin header:
+#   GPIO1_B6 -> LU9685 SCL
+#   GPIO1_B7 -> LU9685 SDA
+#   GND      -> LU9685/servo-power GND
+#
+# Do not enable rt-uart in this config: UART1 uses the same GPIO1_B6/B7 pins on
+# this board. Use orangepi-5-plus-rt-sd-uart.toml for the UART protocol variant.
+features = [
+  "ax-driver/rockchip-dwmmc",
+  "fs",
+  "realtime",
+  "rt-selftest",
+  "rt-i2c",
+]
+log = "Info"
+target = "aarch64-unknown-none-softfloat"
+vm_configs = []
+
+[env]
+AX_RT_CPU = "7"
+SMP = "8"
