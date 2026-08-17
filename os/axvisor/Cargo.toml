@@ -74,6 +74,9 @@ rt-uart = ["dep:axklib", "dep:mmio-api"]
 # header pins 8 TX / 10 RX). The motors are wired as plain TTL UARTs, so no
 # RS485 direction control is needed. Independent pin groups; off by default.
 rt-motor = ["dep:axklib", "dep:mmio-api"]
+# Builds the Wheeled Bipedal Robot control port. It owns its own bounded RT I/O
+# adapters and does not enable the standalone RT device-test tasks.
+rt-wheel = ["dep:axklib", "dep:mmio-api"]
 sstc = ["axvm/sstc"]
 stack-protector = ["ax-std/stack-protector"]
 backtrace = ["ax-std/backtrace", "dep:axbacktrace"]
@@ -144,6 +147,7 @@ ax-driver = { workspace = true, optional = true }
 axbacktrace = { workspace = true, optional = true }
 axklib = { workspace = true, optional = true }
 mmio-api = { workspace = true, optional = true }
+libm = "0.2.16"
 
 [dev-dependencies]
 axtest = { path = "../../components/axtest/axtest" }

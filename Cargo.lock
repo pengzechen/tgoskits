@@ -1613,6 +1613,7 @@ dependencies = [
  "axvmconfig",
  "clap",
  "heapless",
+ "libm",
  "log",
  "mmio-api",
  "prettyplease 0.3.0",

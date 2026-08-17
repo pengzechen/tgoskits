@@ -57,7 +57,12 @@ pub fn mark_rt_devices_ready() {
 
 /// Whether the host has finished bringing up the RT devices. Polled by device
 /// tasks only during boot; after it turns true it stays true for the session.
-#[cfg(any(feature = "rt-i2c", feature = "rt-uart", feature = "rt-motor"))]
+#[cfg(any(
+    feature = "rt-i2c",
+    feature = "rt-uart",
+    feature = "rt-motor",
+    feature = "rt-wheel"
+))]
 pub fn rt_devices_ready() -> bool {
     RT_DEVICES_READY.load(Ordering::Acquire)
 }
@@ -100,6 +105,11 @@ const MOTOR_EXTRA_COUNT: usize = 1;
 #[cfg(not(feature = "rt-motor"))]
 const MOTOR_EXTRA_COUNT: usize = 0;
 
+#[cfg(feature = "rt-wheel")]
+const WHEEL_EXTRA_COUNT: usize = 1;
+#[cfg(not(feature = "rt-wheel"))]
+const WHEEL_EXTRA_COUNT: usize = 0;
+
 #[cfg(all(feature = "rt-i2c", not(feature = "rt-mpu6050")))]
 const I2C_EXTRA: [RtTask; I2C_EXTRA_COUNT] = [RtTask::with_priority(
     "i2c-servo",
@@ -140,6 +150,16 @@ const MOTOR_EXTRA: [RtTask; MOTOR_EXTRA_COUNT] = [RtTask::with_priority(
 #[cfg(not(feature = "rt-motor"))]
 const MOTOR_EXTRA: [RtTask; MOTOR_EXTRA_COUNT] = [];
 
+#[cfg(feature = "rt-wheel")]
+const WHEEL_EXTRA: [RtTask; WHEEL_EXTRA_COUNT] = [RtTask::with_priority(
+    "wheel-control",
+    crate::wheel::WheelController::PERIOD_NANOS,
+    10,
+    crate::wheel::wheel_task,
+)];
+#[cfg(not(feature = "rt-wheel"))]
+const WHEEL_EXTRA: [RtTask; WHEEL_EXTRA_COUNT] = [];
+
 /// Fill value for the const task table initializer. Every slot is overwritten
 /// before the executor sees it, so this no-op never actually runs.
 const RT_TASK_FILL: RtTask = RtTask::with_priority("", 0, 0, _rt_task_noop);
@@ -170,7 +190,8 @@ static RT_TASKS: [RtTask;
         + I2C_EXTRA_COUNT
         + MPU6050_EXTRA_COUNT
         + UART_EXTRA_COUNT
-        + MOTOR_EXTRA_COUNT] = rt_tasks_with_selftest();
+        + MOTOR_EXTRA_COUNT
+        + WHEEL_EXTRA_COUNT] = rt_tasks_with_selftest();
 
 /// Builds the combined RT task table: demo tasks, the self-test suite, the
 /// benchmark suite, then any feature-gated extras. `const` so the table stays a
@@ -183,7 +204,8 @@ const fn rt_tasks_with_selftest() -> [RtTask;
         + I2C_EXTRA_COUNT
         + MPU6050_EXTRA_COUNT
         + UART_EXTRA_COUNT
-        + MOTOR_EXTRA_COUNT] {
+        + MOTOR_EXTRA_COUNT
+        + WHEEL_EXTRA_COUNT] {
     const SELFTEST: [RtTask; 8] = ax_rt::selftest::SELFTEST_TASKS;
     const BENCHMARK: [RtTask; 7] = ax_rt::benchmark::BENCHMARK_TASKS;
     let mut out = [RT_TASK_FILL;
@@ -193,7 +215,8 @@ const fn rt_tasks_with_selftest() -> [RtTask;
             + I2C_EXTRA_COUNT
             + MPU6050_EXTRA_COUNT
             + UART_EXTRA_COUNT
-            + MOTOR_EXTRA_COUNT];
+            + MOTOR_EXTRA_COUNT
+            + WHEEL_EXTRA_COUNT];
     let mut i = 0;
     while i < DEMO_TASK_COUNT {
         out[i] = DEMO_TASKS[i];
@@ -241,26 +264,47 @@ const fn rt_tasks_with_selftest() -> [RtTask;
             + q] = MOTOR_EXTRA[q];
         q += 1;
     }
+    let mut r = 0;
+    while r < WHEEL_EXTRA_COUNT {
+        out[DEMO_TASK_COUNT
+            + SELFTEST.len()
+            + BENCHMARK.len()
+            + I2C_EXTRA_COUNT
+            + MPU6050_EXTRA_COUNT
+            + UART_EXTRA_COUNT
+            + MOTOR_EXTRA_COUNT
+            + r] = WHEEL_EXTRA[r];
+        r += 1;
+    }
     out
 }
 
 #[cfg(not(feature = "rt-selftest"))]
 static RT_TASKS: [RtTask;
-    DEMO_TASK_COUNT + I2C_EXTRA_COUNT + MPU6050_EXTRA_COUNT + UART_EXTRA_COUNT + MOTOR_EXTRA_COUNT] =
-    rt_tasks_base();
+    DEMO_TASK_COUNT
+        + I2C_EXTRA_COUNT
+        + MPU6050_EXTRA_COUNT
+        + UART_EXTRA_COUNT
+        + MOTOR_EXTRA_COUNT
+        + WHEEL_EXTRA_COUNT] = rt_tasks_base();
 
 /// Builds the RT task table without the self-test/benchmark suites: demo tasks
 /// followed by any feature-gated extras.
 #[cfg(not(feature = "rt-selftest"))]
 const fn rt_tasks_base() -> [RtTask;
-    DEMO_TASK_COUNT + I2C_EXTRA_COUNT + MPU6050_EXTRA_COUNT + UART_EXTRA_COUNT + MOTOR_EXTRA_COUNT]
-{
+    DEMO_TASK_COUNT
+        + I2C_EXTRA_COUNT
+        + MPU6050_EXTRA_COUNT
+        + UART_EXTRA_COUNT
+        + MOTOR_EXTRA_COUNT
+        + WHEEL_EXTRA_COUNT] {
     let mut out = [RT_TASK_FILL;
         DEMO_TASK_COUNT
             + I2C_EXTRA_COUNT
             + MPU6050_EXTRA_COUNT
             + UART_EXTRA_COUNT
-            + MOTOR_EXTRA_COUNT];
+            + MOTOR_EXTRA_COUNT
+            + WHEEL_EXTRA_COUNT];
     let mut i = 0;
     while i < DEMO_TASK_COUNT {
         out[i] = DEMO_TASKS[i];
@@ -286,6 +330,16 @@ const fn rt_tasks_base() -> [RtTask;
         out[DEMO_TASK_COUNT + I2C_EXTRA_COUNT + MPU6050_EXTRA_COUNT + UART_EXTRA_COUNT + q] =
             MOTOR_EXTRA[q];
         q += 1;
+    }
+    let mut r = 0;
+    while r < WHEEL_EXTRA_COUNT {
+        out[DEMO_TASK_COUNT
+            + I2C_EXTRA_COUNT
+            + MPU6050_EXTRA_COUNT
+            + UART_EXTRA_COUNT
+            + MOTOR_EXTRA_COUNT
+            + r] = WHEEL_EXTRA[r];
+        r += 1;
     }
     out
 }

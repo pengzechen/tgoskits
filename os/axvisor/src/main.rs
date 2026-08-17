@@ -46,6 +46,8 @@ mod realtime;
 mod shell;
 #[cfg(any(feature = "rt-uart", feature = "rt-motor"))]
 mod uart_rt;
+#[cfg(feature = "rt-wheel")]
+pub mod wheel;
 
 #[cfg(any(feature = "backtrace", feature = "test-panic-no-backtrace"))]
 fn init_panic_hook() {
@@ -149,6 +151,8 @@ fn main() {
     i2c_rt::setup_host_side();
     #[cfg(any(feature = "rt-uart", feature = "rt-motor"))]
     uart_rt::setup_host_side();
+    #[cfg(feature = "rt-wheel")]
+    wheel::setup_host_side();
     realtime::mark_rt_devices_ready();
     realtime::run_rt_selftests();
 
