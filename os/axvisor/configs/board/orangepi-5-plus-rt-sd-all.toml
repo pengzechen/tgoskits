@@ -1,0 +1,31 @@
+# Axvisor RT shell build for OrangePi-5-Plus (RK3588, 8 cores), booted from the
+# microSD card slot, running every RT device test at once: MPU6050 I2C sampling,
+# the LU9685 servo on UART7, and the two Lingkong motors on UART3 / UART6.
+#
+# Wiring on the 40-pin header:
+#   MPU6050 : GPIO1_B6 (SCL, pin 28), GPIO1_B7 (SDA, pin 27), GND, 3V3
+#   Servo   : GPIO1_B5 / UART7 TX (pin 26) -> LU9685 UART RX, GND
+#   Left  motor: GPIO3_B5 / UART3 TX (pin 16) -> motor UART RX,
+#                GPIO3_B6 / UART3 RX (pin 18) <- motor UART TX
+#   Right motor: GPIO1_A1 / UART6 TX (pin 8)  -> motor UART RX,
+#                GPIO1_A0 / UART6 RX (pin 10) <- motor UART TX
+#
+# The four pin groups (I2C5, UART7, UART3, UART6) are all independent, so the
+# features can be combined. This config intentionally omits `rt-demo` and
+# `rt-selftest` so the reserved core runs only the three device tasks:
+# i2c-mpu6050, uart7-servo, uart-motor.
+features = [
+  "ax-driver/rockchip-dwmmc",
+  "fs",
+  "realtime",
+  "rt-mpu6050",
+  "rt-uart",
+  "rt-motor",
+]
+log = "Info"
+target = "aarch64-unknown-none-softfloat"
+vm_configs = []
+
+[env]
+AX_RT_CPU = "7"
+SMP = "8"

@@ -12,6 +12,7 @@ features = [
   "ax-driver/rockchip-dwmmc",
   "fs",
   "realtime",
+  "rt-demo",
   "rt-selftest",
   "rt-uart",
 ]

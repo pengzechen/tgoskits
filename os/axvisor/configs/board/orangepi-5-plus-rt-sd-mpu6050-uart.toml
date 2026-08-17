@@ -1,0 +1,25 @@
+# Axvisor RT shell build for OrangePi-5-Plus (RK3588, 8 cores), booted from the
+# microSD card slot, running the MPU6050 I2C sampler and the LU9685 UART servo
+# concurrently on separate header pins.
+#
+# I2C5 wiring (MPU6050): GPIO1_B6 (SCL, pin 28), GPIO1_B7 (SDA, pin 27), GND, 3V3.
+# UART7 wiring (LU9685): GPIO1_B5 (TX, pin 26) -> LU9685 UART RX, GND.
+#
+# The two protocols use different pin groups (I2C5 on GPIO1_B6/B7, UART7 on
+# GPIO1_B4/B5), so they no longer share pins and can be built together.
+features = [
+  "ax-driver/rockchip-dwmmc",
+  "fs",
+  "realtime",
+  "rt-demo",
+  "rt-selftest",
+  "rt-mpu6050",
+  "rt-uart",
+]
+log = "Info"
+target = "aarch64-unknown-none-softfloat"
+vm_configs = []
+
+[env]
+AX_RT_CPU = "7"
+SMP = "8"

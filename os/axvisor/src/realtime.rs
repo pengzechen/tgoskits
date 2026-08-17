@@ -22,32 +22,60 @@
 //! Rhealstone-style benchmark tasks are appended to the RT task table and driven
 //! from [`run_rt_selftests`].
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use ax_rt::{
-    RtMessage, RtMutex, RtTask, rt_delay_until, rt_exit_current_task, rt_output_write, rt_sleep,
-};
+use ax_rt::{RtMessage, RtTask};
+#[cfg(feature = "rt-demo")]
+use ax_rt::{RtMutex, rt_delay_until, rt_exit_current_task, rt_output_write, rt_sleep};
 pub use ax_rt::{
     RtState, RtTaskState, host_mailbox_recv, host_mailbox_send, rt_mailbox_stats, rt_read_output,
     status,
 };
 
+#[cfg(feature = "rt-demo")]
 const HEARTBEAT_INTERVAL_NANOS: u64 = 1_000_000;
+#[cfg(feature = "rt-demo")]
 const WATCHDOG_INTERVAL_NANOS: u64 = 100_000_000;
+#[cfg(feature = "rt-demo")]
 const HELLO_INTERVAL_NANOS: u64 = 1_000_000_000;
+#[cfg(feature = "rt-demo")]
 const HELLO_RUNS: u64 = 5;
 /// host→RT command tag the shell's `rt send` uses; the self-test echo task
 /// (when `rt-selftest` is enabled) replies with `tag | 0x80`.
 const MAILBOX_CMD_ECHO: u32 = 0x01;
 
+/// Set by the host once every device bring-up in `main()` has finished. The RT
+/// core starts its executor before `main()` runs, so device tasks wait on this
+/// flag before touching hardware instead of racing the host setup.
+static RT_DEVICES_READY: AtomicBool = AtomicBool::new(false);
+
+/// Marks all RT device bring-up complete. Called by the host after the I2C and
+/// UART `setup_host_side` steps.
+pub fn mark_rt_devices_ready() {
+    RT_DEVICES_READY.store(true, Ordering::Release);
+}
+
+/// Whether the host has finished bringing up the RT devices. Polled by device
+/// tasks only during boot; after it turns true it stays true for the session.
+#[cfg(any(feature = "rt-i2c", feature = "rt-uart", feature = "rt-motor"))]
+pub fn rt_devices_ready() -> bool {
+    RT_DEVICES_READY.load(Ordering::Acquire)
+}
+
 static RT_HEARTBEATS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "rt-demo")]
 static RT_WATCHDOG_RUNS: AtomicU64 = AtomicU64::new(0);
 static RT_LAST_HEARTBEAT_NANOS: AtomicU64 = AtomicU64::new(0);
 static RT_LAST_WATCHDOG_NANOS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "rt-demo")]
 static RT_SAMPLE_MUTEX: RtMutex = RtMutex::new();
 
-/// Number of Axvisor demo service tasks that always run on the reserved core.
+/// Number of Axvisor demo service tasks. Gated by the `rt-demo` feature so the
+/// combined device-test config can run only the real device tasks.
+#[cfg(feature = "rt-demo")]
 const DEMO_TASK_COUNT: usize = 3;
+#[cfg(not(feature = "rt-demo"))]
+const DEMO_TASK_COUNT: usize = 0;
 
 /// Optional extra RT tasks appended to the table when their feature is enabled.
 /// Kept as a fixed-length const array so the combined table stays a single
@@ -66,6 +94,11 @@ const MPU6050_EXTRA_COUNT: usize = 0;
 const UART_EXTRA_COUNT: usize = 1;
 #[cfg(not(feature = "rt-uart"))]
 const UART_EXTRA_COUNT: usize = 0;
+
+#[cfg(feature = "rt-motor")]
+const MOTOR_EXTRA_COUNT: usize = 1;
+#[cfg(not(feature = "rt-motor"))]
+const MOTOR_EXTRA_COUNT: usize = 0;
 
 #[cfg(all(feature = "rt-i2c", not(feature = "rt-mpu6050")))]
 const I2C_EXTRA: [RtTask; I2C_EXTRA_COUNT] = [RtTask::with_priority(
@@ -89,7 +122,7 @@ const MPU6050_EXTRA: [RtTask; MPU6050_EXTRA_COUNT] = [];
 
 #[cfg(feature = "rt-uart")]
 const UART_EXTRA: [RtTask; UART_EXTRA_COUNT] = [RtTask::with_priority(
-    "uart7-demo",
+    "uart7-servo",
     100_000_000,
     1,
     crate::uart_rt::uart_task,
@@ -97,14 +130,37 @@ const UART_EXTRA: [RtTask; UART_EXTRA_COUNT] = [RtTask::with_priority(
 #[cfg(not(feature = "rt-uart"))]
 const UART_EXTRA: [RtTask; UART_EXTRA_COUNT] = [];
 
+#[cfg(feature = "rt-motor")]
+const MOTOR_EXTRA: [RtTask; MOTOR_EXTRA_COUNT] = [RtTask::with_priority(
+    "uart-motor",
+    100_000_000,
+    1,
+    crate::uart_rt::motor_task,
+)];
+#[cfg(not(feature = "rt-motor"))]
+const MOTOR_EXTRA: [RtTask; MOTOR_EXTRA_COUNT] = [];
+
+/// Fill value for the const task table initializer. Every slot is overwritten
+/// before the executor sees it, so this no-op never actually runs.
+const RT_TASK_FILL: RtTask = RtTask::with_priority("", 0, 0, _rt_task_noop);
+
+fn _rt_task_noop() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
 /// Axvisor demo service tasks. These are the always-present RT workload; the
 /// self-test and benchmark suites are appended after them when `rt-selftest` is
-/// enabled.
+/// enabled. Empty when the `rt-demo` feature is off.
+#[cfg(feature = "rt-demo")]
 const DEMO_TASKS: [RtTask; DEMO_TASK_COUNT] = [
     RtTask::with_priority("heartbeat", HEARTBEAT_INTERVAL_NANOS, 10, heartbeat_task),
     RtTask::with_priority("watchdog", WATCHDOG_INTERVAL_NANOS, 5, watchdog_task),
     RtTask::with_priority("hello", HELLO_INTERVAL_NANOS, 1, hello_task),
 ];
+#[cfg(not(feature = "rt-demo"))]
+const DEMO_TASKS: [RtTask; DEMO_TASK_COUNT] = [];
 
 #[cfg(feature = "rt-selftest")]
 static RT_TASKS: [RtTask;
@@ -113,7 +169,8 @@ static RT_TASKS: [RtTask;
         + ax_rt::benchmark::BENCHMARK_TASKS.len()
         + I2C_EXTRA_COUNT
         + MPU6050_EXTRA_COUNT
-        + UART_EXTRA_COUNT] = rt_tasks_with_selftest();
+        + UART_EXTRA_COUNT
+        + MOTOR_EXTRA_COUNT] = rt_tasks_with_selftest();
 
 /// Builds the combined RT task table: demo tasks, the self-test suite, the
 /// benchmark suite, then any feature-gated extras. `const` so the table stays a
@@ -125,16 +182,18 @@ const fn rt_tasks_with_selftest() -> [RtTask;
         + ax_rt::benchmark::BENCHMARK_TASKS.len()
         + I2C_EXTRA_COUNT
         + MPU6050_EXTRA_COUNT
-        + UART_EXTRA_COUNT] {
+        + UART_EXTRA_COUNT
+        + MOTOR_EXTRA_COUNT] {
     const SELFTEST: [RtTask; 8] = ax_rt::selftest::SELFTEST_TASKS;
     const BENCHMARK: [RtTask; 7] = ax_rt::benchmark::BENCHMARK_TASKS;
-    let mut out = [DEMO_TASKS[0];
+    let mut out = [RT_TASK_FILL;
         DEMO_TASK_COUNT
             + SELFTEST.len()
             + BENCHMARK.len()
             + I2C_EXTRA_COUNT
             + MPU6050_EXTRA_COUNT
-            + UART_EXTRA_COUNT];
+            + UART_EXTRA_COUNT
+            + MOTOR_EXTRA_COUNT];
     let mut i = 0;
     while i < DEMO_TASK_COUNT {
         out[i] = DEMO_TASKS[i];
@@ -171,20 +230,37 @@ const fn rt_tasks_with_selftest() -> [RtTask;
             + n] = UART_EXTRA[n];
         n += 1;
     }
+    let mut q = 0;
+    while q < MOTOR_EXTRA_COUNT {
+        out[DEMO_TASK_COUNT
+            + SELFTEST.len()
+            + BENCHMARK.len()
+            + I2C_EXTRA_COUNT
+            + MPU6050_EXTRA_COUNT
+            + UART_EXTRA_COUNT
+            + q] = MOTOR_EXTRA[q];
+        q += 1;
+    }
     out
 }
 
 #[cfg(not(feature = "rt-selftest"))]
 static RT_TASKS: [RtTask;
-    DEMO_TASK_COUNT + I2C_EXTRA_COUNT + MPU6050_EXTRA_COUNT + UART_EXTRA_COUNT] = rt_tasks_base();
+    DEMO_TASK_COUNT + I2C_EXTRA_COUNT + MPU6050_EXTRA_COUNT + UART_EXTRA_COUNT + MOTOR_EXTRA_COUNT] =
+    rt_tasks_base();
 
 /// Builds the RT task table without the self-test/benchmark suites: demo tasks
 /// followed by any feature-gated extras.
 #[cfg(not(feature = "rt-selftest"))]
-const fn rt_tasks_base()
--> [RtTask; DEMO_TASK_COUNT + I2C_EXTRA_COUNT + MPU6050_EXTRA_COUNT + UART_EXTRA_COUNT] {
-    let mut out =
-        [DEMO_TASKS[0]; DEMO_TASK_COUNT + I2C_EXTRA_COUNT + MPU6050_EXTRA_COUNT + UART_EXTRA_COUNT];
+const fn rt_tasks_base() -> [RtTask;
+    DEMO_TASK_COUNT + I2C_EXTRA_COUNT + MPU6050_EXTRA_COUNT + UART_EXTRA_COUNT + MOTOR_EXTRA_COUNT]
+{
+    let mut out = [RT_TASK_FILL;
+        DEMO_TASK_COUNT
+            + I2C_EXTRA_COUNT
+            + MPU6050_EXTRA_COUNT
+            + UART_EXTRA_COUNT
+            + MOTOR_EXTRA_COUNT];
     let mut i = 0;
     while i < DEMO_TASK_COUNT {
         out[i] = DEMO_TASKS[i];
@@ -204,6 +280,12 @@ const fn rt_tasks_base()
     while n < UART_EXTRA_COUNT {
         out[DEMO_TASK_COUNT + I2C_EXTRA_COUNT + MPU6050_EXTRA_COUNT + n] = UART_EXTRA[n];
         n += 1;
+    }
+    let mut q = 0;
+    while q < MOTOR_EXTRA_COUNT {
+        out[DEMO_TASK_COUNT + I2C_EXTRA_COUNT + MPU6050_EXTRA_COUNT + UART_EXTRA_COUNT + q] =
+            MOTOR_EXTRA[q];
+        q += 1;
     }
     out
 }
@@ -229,6 +311,7 @@ pub extern "Rust" fn ax_realtime_secondary_main(cpu_id: usize) -> ! {
     )
 }
 
+#[cfg(feature = "rt-demo")]
 fn heartbeat_task() -> ! {
     let mut next_deadline = monotonic_time_nanos();
     loop {
@@ -247,6 +330,7 @@ fn heartbeat_task() -> ! {
     }
 }
 
+#[cfg(feature = "rt-demo")]
 fn watchdog_task() -> ! {
     loop {
         let now = monotonic_time_nanos();
@@ -259,6 +343,7 @@ fn watchdog_task() -> ! {
     }
 }
 
+#[cfg(feature = "rt-demo")]
 fn hello_task() -> ! {
     for index in 1..=HELLO_RUNS {
         rt_output_write(b"hello from RT task ");

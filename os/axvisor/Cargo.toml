@@ -50,6 +50,10 @@ host-xtask = []
 axtest = []
 fs = ["ax-std/ext4fs", "ax-std/fatfs", "axvm/host-fs"]
 realtime = []
+# Runs the Axvisor demo service tasks (heartbeat / watchdog / hello) on the
+# reserved core. The RT board configs enable it for diagnostics; the combined
+# device-test config omits it so only the real device tasks run.
+rt-demo = []
 # Compiles the ax-rt RT primitive self-test suite into the RT task table and
 # runs it from the host boot CPU. Off by default; enabled on the QEMU dev config
 # to keep validating the RT primitives.
@@ -65,6 +69,11 @@ rt-mpu6050 = ["rt-i2c"]
 # UART7 on GPIO1_B4/B5 (40-pin header pins 24 RX / 26 TX), which is a separate
 # pin group from the I2C5 GPIO1_B6/B7 pins. Board-specific; off by default.
 rt-uart = ["dep:axklib", "dep:mmio-api"]
+# Adds an RT task that drives the two Lingkong RS485-protocol motors through
+# RK3588 UART3 (GPIO3_B5/B6, header pins 16 TX / 18 RX) and UART6 (GPIO1_A1/A0,
+# header pins 8 TX / 10 RX). The motors are wired as plain TTL UARTs, so no
+# RS485 direction control is needed. Independent pin groups; off by default.
+rt-motor = ["dep:axklib", "dep:mmio-api"]
 sstc = ["axvm/sstc"]
 stack-protector = ["ax-std/stack-protector"]
 backtrace = ["ax-std/backtrace", "dep:axbacktrace"]

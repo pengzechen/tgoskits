@@ -794,6 +794,10 @@ fn controller_from_published_base() -> Option<Rk3xI2c> {
 /// memory itself.
 #[cfg(not(feature = "rt-mpu6050"))]
 pub fn i2c_servo_task() -> ! {
+    // Wait for the host's I2C5 bring-up before probing the controller.
+    while !crate::realtime::rt_devices_ready() {
+        rt_sleep(1_000_000);
+    }
     let mut probed_mmio = false;
     let mut motion = ServoMotion::new(SERVO_MIN_DEGREES, SERVO_MAX_DEGREES, SERVO_STEP_DEGREES);
     let mut report_countdown = 0u8;
@@ -887,6 +891,10 @@ fn send_servo_positions(controller: &Rk3xI2c, raw_angle: u8) -> Result<(), I2cEr
 
 #[cfg(feature = "rt-mpu6050")]
 pub fn i2c_mpu6050_task() -> ! {
+    // Wait for the host's I2C5 bring-up before probing the controller.
+    while !crate::realtime::rt_devices_ready() {
+        rt_sleep(1_000_000);
+    }
     let mut probed_mmio = false;
     let mut initialized = false;
     let mut active_device = None;
