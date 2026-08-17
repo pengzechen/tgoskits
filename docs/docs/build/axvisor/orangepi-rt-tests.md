@@ -9,7 +9,7 @@ sidebar_label: "OrangePi RT 测试"
 
 ## 1. 测试镜像
 
-RT 测试镜像复用同一套 OrangePi-5-Plus 启动和 I2C/UART bring-up 代码，但每个 board config 只选择一个面向硬件的测试场景。`os/axvisor/src/realtime.rs` 负责把 feature-gated RT task 加入 `RT_TASKS`，`os/axvisor/src/i2c_rt.rs` 和 `os/axvisor/src/uart_rt.rs` 负责具体 I2C5、UART1 的 MMIO 初始化和轮询传输。
+RT 测试镜像复用同一套 OrangePi-5-Plus 启动和 I2C/UART bring-up 代码，但每个 board config 只选择一个面向硬件的测试场景。`os/axvisor/src/realtime.rs` 负责把 feature-gated RT task 加入 `RT_TASKS`，`os/axvisor/src/i2c_rt.rs` 和 `os/axvisor/src/uart_rt.rs` 负责具体 I2C5、UART7 的 MMIO 初始化和轮询传输。
 
 ### 1.1 配置选择
 
@@ -25,12 +25,14 @@ RT 测试镜像复用同一套 OrangePi-5-Plus 启动和 I2C/UART bring-up 代�
 
 ### 1.2 引脚约束
 
-OrangePi-5-Plus 40-pin header 上当前使用的 UART1 和 I2C5 都复用 `GPIO1_B6/B7`。I2C5 使用 `GPIO1_B6` 作为 SCL、`GPIO1_B7` 作为 SDA；UART1 使用同一组 pin 作为 RX/TX，所以同一个镜像不要同时启用 `rt-uart` 和 I2C 类测试，除非后续改到不同 pin group。
+OrangePi-5-Plus 40-pin header 上 I2C5 使用 `GPIO1_B6/B7`（物理引脚 27/28），UART7 使用 `GPIO1_B4/B5`（物理引脚 24/26），两路是独立的 pin group，不共享引脚。I2C5 使用 `GPIO1_B6` 作为 SCL、`GPIO1_B7` 作为 SDA；UART7 使用 `GPIO1_B4` 作为 RX、`GPIO1_B5` 作为 TX。
 
-| 信号 | I2C5 测试 | UART1 测试 |
+| 信号 | I2C5 测试 | UART7 测试 |
 | --- | --- | --- |
-| `GPIO1_B6` | SCL | RX |
-| `GPIO1_B7` | SDA | TX |
+| `GPIO1_B6` (pin 28) | SCL | - |
+| `GPIO1_B7` (pin 27) | SDA | - |
+| `GPIO1_B4` (pin 24) | - | UART7 RX |
+| `GPIO1_B5` (pin 26) | - | UART7 TX |
 | GND | 外设公共地 | 外设公共地 |
 | 3V3 | MPU6050 VCC | 不适用于 UART 信号本身 |
 
@@ -53,7 +55,7 @@ cargo xtask build --config configs/board/orangepi-5-plus-rt-sd-i2c.toml
 
 ### 2.2 LU9685 UART
 
-LU9685 UART 镜像启用 `rt-uart`，使用 RK3588 UART1 和 LU9685 的 `FA address channel angle FE` 串口协议。该镜像与 I2C5 镜像使用同一组 header pin，因此应在切换接线或确认 pinmux 期望后再烧写运行。
+LU9685 UART 镜像启用 `rt-uart`，使用 RK3588 UART7 和 LU9685 的 `FA address channel angle FE` 串口协议。UART7 的 TX 位于 `GPIO1_B5`（物理引脚 26），接到 LU9685 的 UART RX；`GPIO1_B4`（物理引脚 24）作为 RX 预留，当前 TX-only 协议不读取。该镜像与 I2C5 镜像使用不同的 header pin group，接线时按各自协议的引脚走，不要接错。
 
 ```bash
 cd os/axvisor
@@ -149,7 +151,7 @@ RT i2c5 LU9685@I2C5 set physical=60 raw=40 addr=0x00
 RT i2c5 LU9685 write FAIL timeout physical=66 raw=44 CON=... IPD=... CLKDIV=... IEN=...
 ```
 
-UART 版本成功控制舵机时不会走 I2C5 failure path；如果同一轮测试中看到 I2C5 和 UART1 输出混在一起，应回到 board config 检查 feature 是否误合并。
+UART 版本成功控制舵机时不会走 I2C5 failure path；如果同一轮测试中看到 I2C5 和 UART7 输出混在一起，应回到 board config 检查 feature 是否误合并。
 
 ### 4.2 MPU6050 输出
 

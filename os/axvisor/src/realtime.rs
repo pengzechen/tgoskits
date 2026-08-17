@@ -89,7 +89,7 @@ const MPU6050_EXTRA: [RtTask; MPU6050_EXTRA_COUNT] = [];
 
 #[cfg(feature = "rt-uart")]
 const UART_EXTRA: [RtTask; UART_EXTRA_COUNT] = [RtTask::with_priority(
-    "uart1-demo",
+    "uart7-demo",
     100_000_000,
     1,
     crate::uart_rt::uart_task,

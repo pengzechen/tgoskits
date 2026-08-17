@@ -62,8 +62,8 @@ rt-i2c = ["dep:axklib", "dep:mmio-api"]
 # header bus. Requires rt-i2c because that feature owns the I2C5 bring-up.
 rt-mpu6050 = ["rt-i2c"]
 # Adds an RT task that drives configured LU9685 UART devices through RK3588
-# UART1. On OrangePi-5-Plus this uses the same GPIO1_B6/B7 header pins as I2C5,
-# so do not enable it together with rt-i2c unless the board wiring is changed.
+# UART7 on GPIO1_B4/B5 (40-pin header pins 24 RX / 26 TX), which is a separate
+# pin group from the I2C5 GPIO1_B6/B7 pins. Board-specific; off by default.
 rt-uart = ["dep:axklib", "dep:mmio-api"]
 sstc = ["axvm/sstc"]
 stack-protector = ["ax-std/stack-protector"]
