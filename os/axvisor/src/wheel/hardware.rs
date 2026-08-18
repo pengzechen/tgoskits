@@ -65,7 +65,7 @@ const UART_TX_POLL_MAX: u32 = 100_000;
 const UART_RX_DRAIN_MAX: usize = 16;
 const DIAG_EVERY_FAILURES: u32 = 100;
 const MOTOR_ENABLE_RETRY_NANOS: u64 = 10_000_000;
-const HIP_SERVO_SETTLE_NANOS: u64 = 20_000_000_000;
+const HIP_SERVO_SETTLE_NANOS: u64 = 15_000_000_000;
 
 static I2C5_VIRT: AtomicUsize = AtomicUsize::new(0);
 static UART7_VIRT: AtomicUsize = AtomicUsize::new(0);
@@ -100,6 +100,9 @@ pub fn wheel_task() -> ! {
     let mut failure_count = 0u32;
     let mut deadline_miss_count = 0u32;
     let mut motor_failure_count = 0u32;
+    let mut cycle_count = 0u32;
+    let mut right_motor_response_count = 0u32;
+    let mut left_motor_response_count = 0u32;
     let mut next_deadline = rt_monotonic_nanos();
     loop {
         next_deadline = next_deadline.saturating_add(WheelController::PERIOD_NANOS);
@@ -125,6 +128,7 @@ pub fn wheel_task() -> ! {
         match cycle {
             Ok(output) => {
                 failure_count = 0;
+                cycle_count = cycle_count.saturating_add(1);
                 let right_motor_start = rt_monotonic_nanos();
                 let right_motor_result = send_motor_torque(
                     &UART6_PORT,
@@ -133,6 +137,9 @@ pub fn wheel_task() -> ! {
                     &mut right_state,
                 );
                 timing.right_motor_nanos = rt_monotonic_nanos().saturating_sub(right_motor_start);
+                if matches!(right_motor_result, MotorTransactionResult::Ok) {
+                    right_motor_response_count = right_motor_response_count.saturating_add(1);
+                }
                 let left_motor_start = rt_monotonic_nanos();
                 let left_motor_result = send_motor_torque(
                     &UART3_PORT,
@@ -141,6 +148,9 @@ pub fn wheel_task() -> ! {
                     &mut left_state,
                 );
                 timing.left_motor_nanos = rt_monotonic_nanos().saturating_sub(left_motor_start);
+                if matches!(left_motor_result, MotorTransactionResult::Ok) {
+                    left_motor_response_count = left_motor_response_count.saturating_add(1);
+                }
                 if let Some(reason) = right_motor_result.failure_reason() {
                     motor_failure_count = motor_failure_count.saturating_add(1);
                     report_motor_failure(&UART6_PORT, reason, motor_failure_count);
@@ -162,6 +172,14 @@ pub fn wheel_task() -> ! {
                     rt_output_write(b"wheel-control: running 8ms closed-loop task\n");
                     initialized = true;
                 }
+                report_balance_state(
+                    cycle_count,
+                    output,
+                    right_state,
+                    left_state,
+                    right_motor_response_count,
+                    left_motor_response_count,
+                );
             }
             Err(reason) => {
                 failure_count = failure_count.saturating_add(1);
@@ -740,6 +758,55 @@ fn report_motor_protocol_error(err: MotorProtocolError) {
         MotorProtocolError::WrongCommand => rt_output_write(b"wrong-command"),
         MotorProtocolError::WrongMotorId => rt_output_write(b"wrong-id"),
         MotorProtocolError::UnexpectedLength => rt_output_write(b"unexpected-length"),
+    }
+}
+
+fn report_balance_state(
+    cycle_count: u32,
+    output: super::WheelControlOutput,
+    right_state: MotorState2,
+    left_state: MotorState2,
+    right_motor_response_count: u32,
+    left_motor_response_count: u32,
+) {
+    if cycle_count != 1 && cycle_count % DIAG_EVERY_FAILURES != 0 {
+        return;
+    }
+    rt_output_write(b"wheel-control: state cycle=");
+    ax_rt::rt_output_write_decimal(cycle_count as u64);
+    rt_output_write(b" theta_mrad=");
+    rt_write_i32((output.state.theta * 1000.0) as i32);
+    rt_output_write(b" velocity_mmps=");
+    rt_write_i32((output.state.velocity * 1000.0) as i32);
+    rt_output_write(b" right_speed_raw=");
+    rt_write_i16(right_state.speed_raw);
+    rt_output_write(b" left_speed_raw=");
+    rt_write_i16(left_state.speed_raw);
+    rt_output_write(b" right_enc=");
+    ax_rt::rt_output_write_decimal(right_state.encoder as u64);
+    rt_output_write(b" left_enc=");
+    ax_rt::rt_output_write_decimal(left_state.encoder as u64);
+    rt_output_write(b" right_iq=");
+    rt_write_i16(output.motor_command.right_iq);
+    rt_output_write(b" left_iq=");
+    rt_write_i16(output.motor_command.left_iq);
+    rt_output_write(b" right_resp=");
+    ax_rt::rt_output_write_decimal(right_motor_response_count as u64);
+    rt_output_write(b" left_resp=");
+    ax_rt::rt_output_write_decimal(left_motor_response_count as u64);
+    rt_output_write(b"\n");
+}
+
+fn rt_write_i16(value: i16) {
+    rt_write_i32(value as i32);
+}
+
+fn rt_write_i32(value: i32) {
+    if value < 0 {
+        rt_output_write(b"-");
+        ax_rt::rt_output_write_decimal(value.unsigned_abs() as u64);
+    } else {
+        ax_rt::rt_output_write_decimal(value as u64);
     }
 }
 
