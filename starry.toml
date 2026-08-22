@@ -1,0 +1,23 @@
+[base]
+id = 1
+name = "starry"
+guest_type = "passthrough"
+cpu_num = 1
+phys_cpu_ids = [0x00]
+
+[kernel]
+entry_point = 0x4008_0000
+image_location = "fs"
+kernel_load_addr = 0x4008_0000
+kernel_path = "/guest/starry/starryos.bin"   # ← 指向你实际放的文件
+dtb_load_addr = 0x4000_0000
+
+memory_regions = [
+    [0x4000_0000, 0x4000_0000, 0x7, 2],
+    [0x2_4000_0000, 0x8000_0000, 0x7, 1],
+]
+
+[devices]
+passthrough = []
+disabled = [{ path = "/pcie@fe150000" }, { path = "/pcie@fe160000" }, { path = "/pcie@fe170000" }, { path = "/pcie@fe180000" }, { path = "/pcie@fe190000" }]
+

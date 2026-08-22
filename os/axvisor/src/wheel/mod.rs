@@ -7,6 +7,8 @@
 //! helpers here; concrete I2C/UART drivers must enter through deadline-bounded
 //! adapters before this can run as a 5 ms balance loop.
 
+mod command;
+mod console;
 mod control;
 mod controller;
 mod ekf;
@@ -18,6 +20,8 @@ mod motor;
 mod params;
 mod servo;
 
+pub use command::*;
+pub use console::*;
 pub use control::*;
 pub use controller::*;
 pub use ekf::*;

@@ -502,6 +502,11 @@ impl ConsoleCore {
 
 impl SerialBackend for GuestSerialBackend {
     fn write(&self, bytes: &[u8]) {
+        // Channel A (PoC): observe the guest console stream for `@@RT` voice
+        // commands and forward them to the RT core. This never consumes or
+        // rewrites the bytes, so normal console forwarding below is unaffected.
+        #[cfg(feature = "rt-wheel")]
+        crate::wheel::observe_guest_output(self.vm_id, bytes);
         self.core
             .write_guest_output(self.vm_id, self.generation, bytes);
     }

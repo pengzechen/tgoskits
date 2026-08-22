@@ -9,8 +9,9 @@ use ax_rt::{rt_delay_until, rt_monotonic_nanos, rt_output_write};
 use mmio_api::{MapError, MmioRaw};
 
 use super::{
-    WheelController, WheelMeasurements, build_torque_control_frame, convert_mpu6050_sample,
-    hip_servo_channels,
+    WheelController, WheelMeasurements, build_torque_control_frame,
+    command::{CommandGate, WheelCommand, decode_wheel_command},
+    convert_mpu6050_sample, hip_servo_channels,
     imu::RawMpu6050Sample,
     model::RobotModel,
     motor::{MotorProtocolError, MotorState2, TORQUE_RESPONSE_COMMAND},
@@ -66,6 +67,7 @@ const UART_RX_DRAIN_MAX: usize = 16;
 const DIAG_EVERY_FAILURES: u32 = 100;
 const MOTOR_ENABLE_RETRY_NANOS: u64 = 10_000_000;
 const HIP_SERVO_SETTLE_NANOS: u64 = 15_000_000_000;
+const ENABLE_WHEEL_HARDWARE_LOOP: bool = true;
 
 static I2C5_VIRT: AtomicUsize = AtomicUsize::new(0);
 static UART7_VIRT: AtomicUsize = AtomicUsize::new(0);
@@ -73,10 +75,12 @@ static UART3_VIRT: AtomicUsize = AtomicUsize::new(0);
 static UART6_VIRT: AtomicUsize = AtomicUsize::new(0);
 
 pub fn setup_host_side() {
-    setup_i2c5();
-    setup_uart(&UART7_PORT);
-    setup_uart(&UART3_PORT);
-    setup_uart(&UART6_PORT);
+    if ENABLE_WHEEL_HARDWARE_LOOP {
+        setup_i2c5();
+        setup_uart(&UART7_PORT);
+        setup_uart(&UART3_PORT);
+        setup_uart(&UART6_PORT);
+    }
 }
 
 pub fn wheel_task() -> ! {
@@ -84,6 +88,27 @@ pub fn wheel_task() -> ! {
         rt_delay_until(rt_monotonic_nanos().saturating_add(1_000_000));
     }
 
+    if ENABLE_WHEEL_HARDWARE_LOOP {
+        wheel_control_loop();
+    } else {
+        wait_for_voice_commands();
+    }
+}
+
+fn wait_for_voice_commands() -> ! {
+    rt_output_write(b"wheel-control: hardware loop disabled, waiting for Python commands\n");
+    loop {
+        let _ = ax_rt::rt_mailbox_take_pending();
+        while let Some(message) = ax_rt::rt_mailbox_recv() {
+            if let Some(command) = decode_wheel_command(&message) {
+                report_wheel_command(command);
+            }
+        }
+        rt_delay_until(rt_monotonic_nanos().saturating_add(50_000_000));
+    }
+}
+
+fn wheel_control_loop() -> ! {
     rt_output_write(b"wheel-control: RT task started, positioning hip servos\n");
     wait_for_hip_servos_positioned();
     rt_output_write(b"wheel-control: waiting for hip servo settle ns=");
@@ -94,6 +119,7 @@ pub fn wheel_task() -> ! {
     wait_for_motors_enabled();
 
     let mut controller = WheelController::default();
+    let mut command_gate = CommandGate::default();
     let mut right_state = MotorState2::default();
     let mut left_state = MotorState2::default();
     let mut initialized = false;
@@ -107,6 +133,7 @@ pub fn wheel_task() -> ! {
     loop {
         next_deadline = next_deadline.saturating_add(WheelController::PERIOD_NANOS);
         let mut timing = CycleTiming::default();
+        apply_wheel_commands(&mut controller, &mut command_gate);
         let read_start = rt_monotonic_nanos();
         let cycle = read_wheel_measurements(right_state, left_state)
             .inspect(|measurements| {
@@ -209,6 +236,43 @@ pub fn wheel_task() -> ! {
 enum WheelFailure {
     Mpu6050,
     Controller,
+}
+
+/// Drains inbound voice commands and enforces the motion watchdog for one
+/// control cycle.
+///
+/// The inbound ring is drained unconditionally each cycle: the doorbell latch
+/// is only a wake hint, so command delivery does not depend on the RT SGI
+/// handler being installed. A directional command latches its setpoint for
+/// [`CommandGate::HOLD_NANOS`]; once that elapses the setpoint is forced back to
+/// stop so a lost follow-up command never leaves the robot driving.
+fn apply_wheel_commands(controller: &mut WheelController, gate: &mut CommandGate) {
+    let _ = ax_rt::rt_mailbox_take_pending();
+    while let Some(message) = ax_rt::rt_mailbox_recv() {
+        if let Some(command) = decode_wheel_command(&message) {
+            controller.set_target(command.target());
+            gate.arm(command, rt_monotonic_nanos());
+            report_wheel_command(command);
+        }
+    }
+    if gate.expired(rt_monotonic_nanos()) {
+        controller.set_target(WheelCommand::Stop.target());
+        gate.disarm();
+        rt_output_write(b"wheel-control: command hold expired, forcing stop\n");
+    }
+}
+
+fn report_wheel_command(command: WheelCommand) {
+    let label: &[u8] = match command {
+        WheelCommand::Stop => b"stop",
+        WheelCommand::Forward => b"forward",
+        WheelCommand::Backward => b"backward",
+        WheelCommand::Left => b"left",
+        WheelCommand::Right => b"right",
+    };
+    rt_output_write(b"wheel-control: voice command ");
+    rt_output_write(label);
+    rt_output_write(b"\n");
 }
 
 #[derive(Clone, Copy, Default)]
