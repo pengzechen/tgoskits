@@ -14,7 +14,6 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
-use std::{print, println};
 
 use crate::realtime::{
     RtState, RtTaskState, heartbeats, last_heartbeat_nanos, last_watchdog_nanos, mailbox_recv_into,

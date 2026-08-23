@@ -102,7 +102,11 @@ impl ax_rt::MailboxDoorbell for RtCoreDoorbell {
              {MAILBOX_DOORBELL_SGI_TO_RT})",
             percpu::this_cpu_id()
         );
-        irq::send_ipi(mailbox_doorbell_irq(), irq::IpiTarget::Cpu(irq::CpuId(cpu)));
+        if let Err(err) =
+            irq::send_ipi(mailbox_doorbell_irq(), irq::IpiTarget::Cpu(irq::CpuId(cpu)))
+        {
+            warn!("RT mailbox doorbell: failed to notify RT CPU{cpu}: {err:?}");
+        }
     }
 }
 
@@ -122,10 +126,12 @@ impl ax_rt::MailboxDoorbell for HostCoreDoorbell {
         // the shared console lock here. The host logs the reverse IPI when it
         // observes the doorbell, so both directions stay visible without the RT
         // core contending on host-owned logging state.
-        irq::send_ipi(
+        if let Err(err) = irq::send_ipi(
             host_mailbox_doorbell_irq(),
             irq::IpiTarget::Cpu(irq::CpuId(target)),
-        );
+        ) {
+            warn!("RT mailbox doorbell: failed to notify host CPU{target}: {err:?}");
+        }
     }
 }
 
