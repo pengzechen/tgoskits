@@ -1,7 +1,8 @@
 features = []
 log = "Info"
-max_cpu_num = 1
+max_cpu_num = 4
 
 [env]
+AX_RT_CPU = "3"
 BACKTRACE = "y"
 DWARF = "y"

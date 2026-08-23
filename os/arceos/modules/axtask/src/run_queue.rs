@@ -1436,52 +1436,14 @@ pub(crate) unsafe fn clear_prev_task_on_cpu() {
 pub(crate) fn init() {
     let cpu_id = this_cpu_id();
 
-    // Create the `idle` task (not current task).
-    // The idle task will run when there is no other runnable task.
-    #[cfg(feature = "lockdep")]
-    let idle_task_stack_size = crate::default_task_stack_size();
-    // TODO: Consider unifying the non-lockdep idle stack size with the task stack configuration.
-    #[cfg(not(feature = "lockdep"))]
-    let idle_task_stack_size = 16384;
-    let idle_task = TaskInner::new(|| crate::run_idle(), "idle".into(), idle_task_stack_size);
-    // idle task should be pinned to the current CPU.
-    idle_task.set_cpumask(AxCpuMask::one_shot(cpu_id));
-    // SAFETY: scheduler bootstrap runs before this CPU can schedule or accept
-    // interrupts, and each callback keeps its mutable borrow local.
-    unsafe {
-        ax_hal::percpu::with_cpu_pin(|pin| {
-            ax_hal::percpu::with_exclusive_cpu(pin, |exclusive| {
-                IDLE_TASK.with_current_mut(exclusive, |idle| {
-                    idle.init_once(idle_task.into_arc());
-                })
-            })
-        })
-    }
-    .expect("scheduler bootstrap requires an installed CPU-local area");
+    init_idle_task(cpu_id);
 
     // Put the subsequent execution into the `main` task.
     let main_task = TaskInner::new_init("main".into(), main_task_stack()).into_arc();
     main_task.set_state(TaskState::Running);
     unsafe { CurrentTask::init_current(main_task) }
 
-    let run_queue = unsafe {
-        ax_hal::percpu::with_cpu_pin(|pin| {
-            ax_hal::percpu::with_exclusive_cpu(pin, |exclusive| {
-                RUN_QUEUE.with_current_mut(exclusive, |run_queue| {
-                    run_queue.init_once(AxRunQueue::new(cpu_id));
-                    NonNull::from(
-                        run_queue
-                            .get_mut()
-                            .expect("run queue must be initialized during bootstrap"),
-                    )
-                })
-            })
-        })
-    }
-    .expect("scheduler bootstrap requires an installed CPU-local area");
-    unsafe {
-        RUN_QUEUES[cpu_id].write(run_queue);
-    }
+    init_current_run_queue(cpu_id, "run queue must be initialized during bootstrap");
 }
 
 pub(crate) fn init_secondary(stack_ptr: VirtAddr, stack_size: usize) {
@@ -1508,16 +1470,56 @@ pub(crate) fn init_secondary(stack_ptr: VirtAddr, stack_size: usize) {
     .expect("secondary scheduler bootstrap requires an installed CPU-local area");
     unsafe { CurrentTask::init_current(idle_task) }
 
+    init_current_run_queue(cpu_id, "secondary run queue must be initialized");
+}
+
+pub(crate) fn init_secondary_main(stack_ptr: VirtAddr, stack_size: usize) {
+    let cpu_id = this_cpu_id();
+
+    init_idle_task(cpu_id);
+
+    let main_task = TaskInner::new_init(
+        "main".into(),
+        TaskStack::borrowed(stack_ptr, stack_size, TASK_STACK_ALIGN),
+    )
+    .into_arc();
+    main_task.set_state(TaskState::Running);
+    unsafe { CurrentTask::init_current(main_task) }
+
+    init_current_run_queue(cpu_id, "secondary main run queue must be initialized");
+}
+
+fn init_idle_task(cpu_id: usize) {
+    // Create the `idle` task (not current task). The idle task will run when
+    // there is no other runnable task.
+    #[cfg(feature = "lockdep")]
+    let idle_task_stack_size = crate::default_task_stack_size();
+    // TODO: Consider unifying the non-lockdep idle stack size with the task stack configuration.
+    #[cfg(not(feature = "lockdep"))]
+    let idle_task_stack_size = 16384;
+    let idle_task = TaskInner::new(|| crate::run_idle(), "idle".into(), idle_task_stack_size);
+    idle_task.set_cpumask(AxCpuMask::one_shot(cpu_id));
+    // SAFETY: scheduler bootstrap runs before this CPU can schedule or accept
+    // interrupts, and each callback keeps its mutable borrow local.
+    unsafe {
+        ax_hal::percpu::with_cpu_pin(|pin| {
+            ax_hal::percpu::with_exclusive_cpu(pin, |exclusive| {
+                IDLE_TASK.with_current_mut(exclusive, |idle| {
+                    idle.init_once(idle_task.into_arc());
+                })
+            })
+        })
+    }
+    .expect("scheduler bootstrap requires an installed CPU-local area");
+}
+
+fn init_current_run_queue(cpu_id: usize, missing_message: &str) {
     let run_queue = unsafe {
         ax_hal::percpu::with_cpu_pin(|pin| {
             ax_hal::percpu::with_exclusive_cpu(pin, |exclusive| {
                 RUN_QUEUE.with_current_mut(exclusive, |run_queue| {
                     run_queue.init_once(AxRunQueue::new(cpu_id));
-                    NonNull::from(
-                        run_queue
-                            .get_mut()
-                            .expect("secondary run queue must be initialized"),
-                    )
+                    NonNull::from(run_queue.get_mut().expect(missing_message))
                 })
             })
         })

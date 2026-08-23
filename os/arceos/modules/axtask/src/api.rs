@@ -223,6 +223,14 @@ pub fn init_scheduler_secondary(stack_ptr: VirtAddr, stack_size: usize) {
     crate::run_queue::init_secondary(stack_ptr, stack_size);
 }
 
+/// Initializes a secondary CPU scheduler with a non-idle current task.
+///
+/// This is used by runtimes that physically reserve a CPU for an application
+/// entry point instead of letting that CPU join the ordinary idle loop.
+pub fn init_scheduler_secondary_main(stack_ptr: VirtAddr, stack_size: usize) {
+    crate::run_queue::init_secondary_main(stack_ptr, stack_size);
+}
+
 /// Handles periodic timer ticks for the task manager.
 ///
 /// For example, advance scheduler states, checks timed events, etc.

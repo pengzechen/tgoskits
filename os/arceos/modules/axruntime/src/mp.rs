@@ -15,7 +15,7 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(feature = "multitask")]
-use ax_hal::mem::VirtAddr;
+pub(crate) use ax_hal::mem::VirtAddr;
 
 static SECONDARY_CPUID_BY_SLOT: [AtomicUsize; crate::build_info::CPU_CAPACITY - 1] =
     [const { AtomicUsize::new(usize::MAX) }; crate::build_info::CPU_CAPACITY - 1];
@@ -23,7 +23,7 @@ static SECONDARY_CPUID_BY_SLOT: [AtomicUsize; crate::build_info::CPU_CAPACITY - 
 static ENTERED_CPUS: AtomicUsize = AtomicUsize::new(1);
 
 #[cfg(feature = "multitask")]
-fn secondary_boot_stack_bounds(cpu_id: usize) -> (VirtAddr, usize) {
+pub(crate) fn secondary_boot_stack_bounds(cpu_id: usize) -> (VirtAddr, usize) {
     ax_hal::mem::boot_stack_bounds(cpu_id)
 }
 

@@ -242,13 +242,32 @@ fn host_cpu_count() -> usize {
     1
 }
 
-#[cfg(feature = "smp")]
+#[cfg(all(feature = "smp", not(feature = "sched-rt-fifo")))]
 pub(crate) fn run_realtime_secondary(cpu_id: usize) -> ! {
     unsafe extern "Rust" {
         safe fn ax_realtime_secondary_main(cpu_id: usize) -> !;
     }
 
     ax_realtime_secondary_main(cpu_id)
+}
+
+#[cfg(all(feature = "smp", feature = "multitask", feature = "sched-rt-fifo"))]
+pub(crate) fn run_realtime_secondary(cpu_id: usize) -> ! {
+    ax_hal::init_later_secondary(cpu_id);
+
+    let (stack_ptr, stack_size) = mp::secondary_boot_stack_bounds(cpu_id);
+    ax_task::init_scheduler_secondary_main(stack_ptr, stack_size);
+    preempt::release_bootstrap();
+
+    #[cfg(feature = "irq")]
+    ax_hal::asm::enable_irqs();
+
+    #[cfg(all(feature = "irq", feature = "multitask"))]
+    serial::mark_log_wake_ready(cpu_id);
+
+    info!("Realtime FIFO CPU {cpu_id} init OK; entering ArceOS app.");
+    ax_app_entry();
+    terminate();
 }
 
 /// The main entry point of the ArceOS runtime.
@@ -451,7 +470,18 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     if host_cpu_count() == ax_hal::cpu_num() {
         fs::online_smp();
     } else {
-        warn!("Skip block runtime SMP online while Axvisor realtime CPU split is active.");
+        warn!("Skip block runtime SMP online while realtime CPU split is active.");
+    }
+
+    #[cfg(all(feature = "smp", feature = "sched-rt-fifo"))]
+    if build_info::REALTIME_CPU_ENABLED {
+        info!(
+            "ArceOS app entry is assigned to realtime CPU {}.",
+            build_info::REALTIME_CPU
+        );
+        loop {
+            ax_hal::asm::wait_for_irqs();
+        }
     }
 
     ax_app_entry();
