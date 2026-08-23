@@ -14,11 +14,13 @@
 
 mod base;
 mod history;
+#[cfg(feature = "realtime")]
 mod rt;
 mod vm;
 
 pub use base::*;
 pub use history::*;
+#[cfg(feature = "realtime")]
 pub use rt::*;
 pub use vm::*;
 
@@ -373,6 +375,7 @@ fn build_command_tree() -> BTreeMap<String, CommandNode> {
     let mut tree = BTreeMap::new();
 
     build_base_cmd(&mut tree);
+    #[cfg(feature = "realtime")]
     build_rt_cmd(&mut tree);
     build_vm_cmd(&mut tree);
 

@@ -42,6 +42,7 @@ mod http;
 #[cfg(feature = "rt-i2c")]
 mod i2c_rt;
 mod manager;
+#[cfg(feature = "realtime")]
 mod realtime;
 mod shell;
 #[cfg(any(feature = "rt-uart", feature = "rt-motor"))]
@@ -146,6 +147,7 @@ fn main() {
 
     #[cfg(not(feature = "no-auto-start"))]
     info!("[OK] Default guest initialized");
+    #[cfg(feature = "realtime")]
     ax_realtime::setup_host_side();
     #[cfg(feature = "rt-i2c")]
     i2c_rt::setup_host_side();
@@ -153,7 +155,9 @@ fn main() {
     uart_rt::setup_host_side();
     #[cfg(feature = "rt-wheel")]
     wheel::setup_host_side();
+    #[cfg(feature = "realtime")]
     realtime::mark_rt_devices_ready();
+    #[cfg(feature = "realtime")]
     realtime::run_rt_selftests();
 
     // The management console runs on the primary CPU (Core 0) while the vCPU

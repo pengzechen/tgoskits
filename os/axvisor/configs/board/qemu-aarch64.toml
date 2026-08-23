@@ -1,19 +1,19 @@
 features = [
     "ax-driver/nvme",
     "fs",
-    # Runs the ax-rt RT primitive self-test suite at boot (validates priority
-    # inheritance, recursive mutex, semaphore, host<->RT mailbox round-trip).
-    "rt-selftest",
+    # Uses the ArceOS axtask realtime FIFO scheduler and sleepable mutex
+    # priority inheritance path. This does not enable Axvisor's ax-rt executor.
+    "sched-rt-fifo",
     # Capturing a backtrace is an expensive runtime operation.
     # Enable "backtrace" and [env] BACKTRACE = "y" below to
     # activate panic backtrace. Disabled by default for release.
     # "backtrace",
 ]
 log = "Info"
+max_cpu_num = 4
 target = "aarch64-unknown-none-softfloat"
 vm_configs = []
 
-# Set BACKTRACE=y together with the "backtrace" feature above to
-# add -Cforce-frame-pointers=yes via axbuild.
-# [env]
+[env]
+AX_RT_CPU = "3"
 # BACKTRACE = "y"

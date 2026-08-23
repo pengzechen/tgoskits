@@ -49,34 +49,35 @@ default = []
 host-xtask = []
 axtest = []
 fs = ["ax-std/ext4fs", "ax-std/fatfs", "axvm/host-fs"]
-realtime = []
+realtime = ["dep:ax-rt", "dep:ax-realtime"]
 # Runs the Axvisor demo service tasks (heartbeat / watchdog / hello) on the
 # reserved core. The RT board configs enable it for diagnostics; the combined
 # device-test config omits it so only the real device tasks run.
-rt-demo = []
+rt-demo = ["realtime"]
 # Compiles the ax-rt RT primitive self-test suite into the RT task table and
 # runs it from the host boot CPU. Off by default; enabled on the QEMU dev config
 # to keep validating the RT primitives.
-rt-selftest = ["ax-rt/selftest"]
+rt-selftest = ["realtime", "ax-rt/selftest"]
+sched-rt-fifo = ["ax-std/sched-rt-fifo"]
 # Adds an RT task on the reserved core that brings up RK3588 I2C5 (a 40-pin
 # header bus, `disabled` in the DTB) and drives configured LU9685 I2C devices.
 # Board-specific; off by default.
-rt-i2c = ["dep:axklib", "dep:mmio-api"]
+rt-i2c = ["realtime", "dep:axklib", "dep:mmio-api"]
 # Adds an RT task that probes and samples an MPU6050 on the same RK3588 I2C5
 # header bus. Requires rt-i2c because that feature owns the I2C5 bring-up.
 rt-mpu6050 = ["rt-i2c"]
 # Adds an RT task that drives configured LU9685 UART devices through RK3588
 # UART7 on GPIO1_B4/B5 (40-pin header pins 24 RX / 26 TX), which is a separate
 # pin group from the I2C5 GPIO1_B6/B7 pins. Board-specific; off by default.
-rt-uart = ["dep:axklib", "dep:mmio-api"]
+rt-uart = ["realtime", "dep:axklib", "dep:mmio-api"]
 # Adds an RT task that drives the two Lingkong RS485-protocol motors through
 # RK3588 UART3 (GPIO3_B5/B6, header pins 16 TX / 18 RX) and UART6 (GPIO1_A1/A0,
 # header pins 8 TX / 10 RX). The motors are wired as plain TTL UARTs, so no
 # RS485 direction control is needed. Independent pin groups; off by default.
-rt-motor = ["dep:axklib", "dep:mmio-api"]
+rt-motor = ["realtime", "dep:axklib", "dep:mmio-api"]
 # Builds the Wheeled Bipedal Robot control port. It owns its own bounded RT I/O
 # adapters and does not enable the standalone RT device-test tasks.
-rt-wheel = ["dep:axklib", "dep:mmio-api"]
+rt-wheel = ["realtime", "dep:axklib", "dep:mmio-api"]
 sstc = ["axvm/sstc"]
 stack-protector = ["ax-std/stack-protector"]
 backtrace = ["ax-std/backtrace", "dep:axbacktrace"]
@@ -132,8 +133,8 @@ ax-std = { workspace = true, default-features = false, features = [
 ] }
 # System dependent modules provided by ArceOS-Hypervisor (bare-metal only)
 # ax-runtime = { version = "=0.3.0-preview.1", features = ["alloc", "irq", "paging", "smp", "multitask"] }
-ax-rt.workspace = true
-ax-realtime.workspace = true
+ax-rt = { workspace = true, optional = true }
+ax-realtime = { workspace = true, optional = true }
 axvm = { workspace = true, default-features = false, features = ["tls"] }
 axvmconfig = { workspace = true, default-features = false }
 axvm-types.workspace = true

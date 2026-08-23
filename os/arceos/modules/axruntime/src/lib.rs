@@ -260,6 +260,9 @@ pub(crate) fn run_realtime_secondary(cpu_id: usize) -> ! {
     preempt::release_bootstrap();
 
     #[cfg(feature = "irq")]
+    init_percpu_irq(cpu_id);
+
+    #[cfg(feature = "irq")]
     ax_hal::asm::enable_irqs();
 
     #[cfg(all(feature = "irq", feature = "multitask"))]
@@ -268,6 +271,16 @@ pub(crate) fn run_realtime_secondary(cpu_id: usize) -> ! {
     info!("Realtime FIFO CPU {cpu_id} init OK; entering ArceOS app.");
     ax_app_entry();
     terminate();
+}
+
+#[cfg(all(feature = "smp", feature = "sched-rt-fifo"))]
+fn scheduler_timer_cpu_count() -> usize {
+    ax_hal::cpu_num()
+}
+
+#[cfg(not(all(feature = "smp", feature = "sched-rt-fifo")))]
+fn scheduler_timer_cpu_count() -> usize {
+    host_cpu_count()
 }
 
 /// The main entry point of the ArceOS runtime.
@@ -555,12 +568,13 @@ pub(crate) fn init_percpu_irq(cpu_id: usize) {
     ax_hal::irq::init_common_irq_handler();
 
     if ax_hal::percpu::this_cpu_is_bsp() {
-        let cpus = ax_hal::irq::CpuMask::first_n(host_cpu_count());
+        let cpus = ax_hal::irq::CpuMask::first_n(scheduler_timer_cpu_count());
         ax_hal::irq::request_percpu_irq(ax_hal::time::irq_num(), cpus, timer_irq_handler)
             .expect("failed to register timer IRQ handler");
 
         #[cfg(any(feature = "ipi", feature = "wake-ipi"))]
         {
+            let cpus = ax_hal::irq::CpuMask::first_n(host_cpu_count());
             // On riscv64 there is exactly one supervisor software interrupt per
             // hart, so a reserved realtime core's mailbox doorbell must share
             // this same line as a separate per-CPU action (the scheduler IPI
