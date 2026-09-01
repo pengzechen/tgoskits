@@ -1,0 +1,13 @@
+[package]
+name = "es8388"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Portable ES8388/ES8323 capture-path register model and init sequence"
+keywords = ["es8388", "es8323", "codec", "audio", "no-std"]
+categories = ["embedded", "hardware-support", "no-std"]
+
+[dependencies]
+thiserror = { workspace = true }

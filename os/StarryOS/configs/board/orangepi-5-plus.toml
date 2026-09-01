@@ -13,6 +13,7 @@ features = [
   "ax-driver/rk3588-cpufreq",
   "rknpu",
   "rk3588-pwm",
+  "rk3588-audio",
 ]
 log = "Info"
 max_cpu_num = 8

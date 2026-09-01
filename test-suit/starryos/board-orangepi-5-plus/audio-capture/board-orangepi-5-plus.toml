@@ -1,0 +1,44 @@
+board_type = "OrangePi-5-Plus"
+shell_prefix = "root@starry:/root #"
+shell_init_cmd = '''
+marker=STARRY_AUDIO_CAPTURE
+url='${sessionFile:bin/audio-capture}'
+prog=/tmp/audio-capture
+net=0
+i=0
+while [ "$i" -lt 30 ]; do
+  if ip addr show dev eth0 2>/dev/null | grep -q 'inet '; then
+    net=1
+    break
+  fi
+  i=$((i + 1))
+  sleep 1
+done
+if [ "$net" != 1 ]; then
+  echo "${marker}_FAILED: no_network"
+else
+  rm -f "$prog"
+  if command -v curl >/dev/null 2>&1; then
+    curl --connect-timeout 10 --max-time 30 -fsSL "$url" -o "$prog"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -T 30 -O "$prog" "$url"
+  else
+    echo "${marker}_FAILED: no_downloader"
+    false
+  fi &&
+  chmod +x "$prog" &&
+  "$prog" ||
+  echo "${marker}_FAILED: session_setup_or_execution"
+fi
+'''
+success_regex = ["(?m)^STARRY_AUDIO_CAPTURE_OK\\b"]
+fail_regex = [
+  '(?i)\bpanic(?:ked)?\b',
+  '(?i)segmentation fault',
+  '(?i)SIGSEGV',
+  'exit with code: 139',
+  "(?i)(wget|curl|chmod|sh): .*not found",
+  "(?m)^STARRY_AUDIO_CAPTURE_NODATA\\b",
+  "(?m)^STARRY_AUDIO_CAPTURE_FAILED\\b",
+]
+timeout = 240

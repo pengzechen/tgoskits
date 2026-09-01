@@ -1,0 +1,15 @@
+[package]
+name = "rockchip-i2s-tdm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Portable RK3588 I2S/TDM capture core and PCM ring buffer"
+keywords = ["rk3588", "i2s", "tdm", "audio", "no-std"]
+categories = ["embedded", "hardware-support", "no-std"]
+
+[dependencies]
+mmio-api = { workspace = true }
+thiserror = { workspace = true }
+

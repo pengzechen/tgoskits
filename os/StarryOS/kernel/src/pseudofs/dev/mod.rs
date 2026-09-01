@@ -1,5 +1,11 @@
 //! Special devices
 
+#[cfg(feature = "rk3588-audio")]
+mod audio;
+#[cfg(feature = "rk3588-audio")]
+mod audio_clk;
+#[cfg(feature = "rk3588-audio")]
+mod audio_codec;
 mod card0;
 #[cfg(feature = "rknpu")]
 mod card1;
@@ -592,6 +598,30 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             Arc::new(rtc::Rtc),
         ),
     );
+
+    #[cfg(feature = "rk3588-audio")]
+    {
+        // Phase 2: bring up the SoC I2S0 RX clock tree (mclk_i2s0_8ch_rx =
+        // 12.288 MHz) on the main CRU first, so the ES8388 sees a stable MCLK
+        // when its ADC is powered and so the RX FIFO can advance.
+        audio_clk::bring_up_i2s0_rx_clocks();
+        // Phase 1 + 3: prove the i2c7 bus reaches the ES8388 (read-back != 0xff),
+        // then program the codec's ADC capture path over I2C. Best-effort; the
+        // I2S capture node below probes independently of this bring-up.
+        audio_codec::bring_up_es8388_capture();
+        if let Some(audio_dev) = audio::AudioCaptureDev::probe().map(Arc::new) {
+            audio_dev.register_irq();
+            root.add(
+                "audio0",
+                Device::new(
+                    fs.clone(),
+                    NodeType::CharacterDevice,
+                    audio::AUDIO_DEVICE_ID,
+                    audio_dev,
+                ),
+            );
+        }
+    }
 
     #[cfg(feature = "k230-kpu")]
     {

@@ -28,6 +28,7 @@ features = [
     "ax-runtime/rtc",
     "smp",
     "starry-kernel/input",
+    "starry-kernel/rk3588-audio",
     "starry-kernel/vsock",
 ]
 
@@ -53,6 +54,7 @@ features = [
     "rga",
     "smp",
     "starry-kernel/input",
+    "starry-kernel/rk3588-audio",
     "starry-kernel/vsock",
 ]
 
@@ -79,6 +81,14 @@ rk3588-pwm = [
     "dep:rdif-pwm",
 ]
 k230-kpu = ["ax-hal/xuantie-c9xx", "dep:k230-kpu"]
+rk3588-audio = [
+    "dep:audio-capture",
+    "dep:rockchip-i2s-tdm",
+    "dep:es8388",
+    "dep:mmio-api",
+    "dep:rdif-pinctrl",
+    "dep:rockchip-pm",
+]
 vsock = ["ax-runtime/vsock"]
 dynamic_debug = ["ipi"]
 sg2002 = [
@@ -145,6 +155,11 @@ ax-task = { workspace = true, features = [
 rockchip-rga = { workspace = true, optional = true }
 sg2002-tpu = { workspace = true, optional = true }
 k230-kpu = { workspace = true, optional = true }
+audio-capture = { workspace = true, optional = true }
+mmio-api = { workspace = true, optional = true }
+rockchip-i2s-tdm = { workspace = true, optional = true }
+es8388 = { workspace = true, optional = true }
+rockchip-pm = { workspace = true, optional = true }
 crab-usb.workspace = true
 usb-serial.workspace = true
 rdrive.workspace = true

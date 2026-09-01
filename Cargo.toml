@@ -64,6 +64,7 @@ members = [
     "components/percpu/percpu_macros",
 
     "drivers/ax-driver",
+    "drivers/audio/*",
     "drivers/blk/*",
     "drivers/examples/*",
     "drivers/firmware/*",
@@ -248,6 +249,9 @@ k230-kpu = { version = "0.1.0", path = "drivers/npu/k230-kpu" }
 realtek-rtl8125 = { version = "0.2.12", path = "drivers/net/realtek-rtl8125" }
 rockchip-pm = { version = "0.4.8", path = "drivers/soc/rockchip/rockchip-pm" }
 rockchip-soc = { version = "0.4.4", path = "drivers/soc/rockchip/rockchip-soc" }
+rockchip-i2s-tdm = { version = "0.5.14", path = "drivers/audio/rockchip-i2s-tdm" }
+es8388 = { version = "0.5.14", path = "drivers/audio/es8388" }
+audio-capture = { version = "0.5.14", path = "drivers/audio/audio-capture" }
 sg2002-tpu = { version = "0.3.10", path = "drivers/tpu/sg2002-tpu" }
 rdrive = { version = "0.23.9", path = "drivers/rdrive" }
 rdrive-macros = { version = "0.4.3", path = "drivers/rdrive-macros" }

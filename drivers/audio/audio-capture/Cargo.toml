@@ -1,0 +1,13 @@
+[package]
+name = "audio-capture"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Portable /dev/audio0 capture-stream runtime for the RK3588/ES8388 path"
+keywords = ["audio", "capture", "pcm", "no-std"]
+categories = ["embedded", "no-std"]
+
+[dependencies]
+rockchip-i2s-tdm = { workspace = true }
